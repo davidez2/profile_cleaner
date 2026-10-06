@@ -13,10 +13,10 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # --- MAIN FORM ---
-$Form = New-Object System.Windows.Forms.Form
-$Form.Text = "Windows Stale User Profile Manager (PowerShell)"
-$Form.Size = New-Object System.Drawing.Size(960, 720)$Form.StartPosition = "CenterScreen"
-$Form.MinimumSize = New-Object System.Drawing.Size(850, 600)
+$script:Form = New-Object System.Windows.Forms.Form
+$script:Form.Text = "Windows Stale User Profile Manager (PowerShell)"
+$script:Form.Size = New-Object System.Drawing.Size(960, 720)$script:Form.StartPosition = "CenterScreen"
+$script:Form.MinimumSize = New-Object System.Drawing.Size(850, 600)
 
 # --- TOP GROUP (Scan Inputs) ---
 $GroupScan = New-Object System.Windows.Forms.GroupBox
@@ -31,10 +31,10 @@ $lblComp.Location = New-Object System.Drawing.Point(15, 28)
 $lblComp.AutoSize =$true
 $GroupScan.Controls.Add($lblComp)
 
-$txtComp = New-Object System.Windows.Forms.TextBox
-$txtComp.Text = "localhost"
-$txtComp.Location = New-Object System.Drawing.Point(120, 25)$txtComp.Size = New-Object System.Drawing.Size(140, 23)
-$GroupScan.Controls.Add($txtComp)
+$script:txtComp = New-Object System.Windows.Forms.TextBox
+$script:txtComp.Text = "localhost"
+$script:txtComp.Location = New-Object System.Drawing.Point(120, 25)$script:txtComp.Size = New-Object System.Drawing.Size(140, 23)
+$GroupScan.Controls.Add($script:txtComp)
 
 # Stale Days
 $lblDays = New-Object System.Windows.Forms.Label
@@ -43,11 +43,11 @@ $lblDays.Location = New-Object System.Drawing.Point(280, 28)
 $lblDays.AutoSize =$true
 $GroupScan.Controls.Add($lblDays)
 
-$numDays = New-Object System.Windows.Forms.NumericUpDown
-$numDays.Value = 90
-$numDays.Maximum = 3650$numDays.Minimum = 1
-$numDays.Location = New-Object System.Drawing.Point(420, 25)$numDays.Size = New-Object System.Drawing.Size(65, 23)
-$GroupScan.Controls.Add($numDays)
+$script:numDays = New-Object System.Windows.Forms.NumericUpDown
+$script:numDays.Value = 90
+$script:numDays.Maximum = 3650$script:numDays.Minimum = 1
+$script:numDays.Location = New-Object System.Drawing.Point(420, 25)$script:numDays.Size = New-Object System.Drawing.Size(65, 23)
+$GroupScan.Controls.Add($script:numDays)
 
 # 7-Zip Path
 $lbl7z = New-Object System.Windows.Forms.Label
@@ -56,10 +56,10 @@ $lbl7z.Location = New-Object System.Drawing.Point(505, 28)
 $lbl7z.AutoSize =$true
 $GroupScan.Controls.Add($lbl7z)
 
-$txt7z = New-Object System.Windows.Forms.TextBox
-$txt7z.Text = "C:\Program Files\7-Zip\7z.exe"
-$txt7z.Location = New-Object System.Drawing.Point(575, 25)$txt7z.Size = New-Object System.Drawing.Size(190, 23)
-$GroupScan.Controls.Add($txt7z)
+$script:txt7z = New-Object System.Windows.Forms.TextBox
+$script:txt7z.Text = "C:\Program Files\7-Zip\7z.exe"
+$script:txt7z.Location = New-Object System.Drawing.Point(575, 25)$script:txt7z.Size = New-Object System.Drawing.Size(190, 23)
+$GroupScan.Controls.Add($script:txt7z)
 
 # Scan Button
 $btnScan = New-Object System.Windows.Forms.Button
@@ -68,47 +68,47 @@ $btnScan.Location = New-Object System.Drawing.Point(780, 20)$btnScan.Size = New-
 $btnScan.Font = New-Object System.Drawing.Font($btnScan.Font, [System.Drawing.FontStyle]::Bold)
 $GroupScan.Controls.Add($btnScan)
 
-$Form.Controls.Add($GroupScan)
+$script:Form.Controls.Add($GroupScan)
 
 # --- MIDDLE GRID ACTIONS ---
 $btnSelectAll = New-Object System.Windows.Forms.Button
 $btnSelectAll.Text = "Select All"
 $btnSelectAll.Location = New-Object System.Drawing.Point(12, 95)$btnSelectAll.Size = New-Object System.Drawing.Size(90, 25)
-$Form.Controls.Add($btnSelectAll)
+$script:Form.Controls.Add($btnSelectAll)
 
 $btnDeselectAll = New-Object System.Windows.Forms.Button
 $btnDeselectAll.Text = "Deselect All"
 $btnDeselectAll.Location = New-Object System.Drawing.Point(108, 95)$btnDeselectAll.Size = New-Object System.Drawing.Size(90, 25)
-$Form.Controls.Add($btnDeselectAll)
+$script:Form.Controls.Add($btnDeselectAll)
 
 # --- DATA GRID ---
-$Grid = New-Object System.Windows.Forms.DataGridView
-$Grid.Location = New-Object System.Drawing.Point(12, 125)$Grid.Size = New-Object System.Drawing.Size(920, 420)
-$Grid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right$Grid.AllowUserToAddRows = $false$Grid.AllowUserToDeleteRows = $false$Grid.SelectionMode = "FullRowSelect"
-$Grid.AutoSizeColumnsMode = "Fill"
-$Grid.MultiSelect =$false
+$script:Grid = New-Object System.Windows.Forms.DataGridView
+$script:Grid.Location = New-Object System.Drawing.Point(12, 125)$script:Grid.Size = New-Object System.Drawing.Size(920, 420)
+$script:Grid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right$script:Grid.AllowUserToAddRows = $false$script:Grid.AllowUserToDeleteRows = $false$script:Grid.SelectionMode = "FullRowSelect"
+$script:Grid.AutoSizeColumnsMode = "Fill"
+$script:Grid.MultiSelect =$false
 
 # Columns
 $colChk = New-Object System.Windows.Forms.DataGridViewCheckBoxColumn
 $colChk.HeaderText = "[X]"
 $colChk.Name = "Select"
 $colChk.Width = 45
-$Grid.Columns.Add($colChk) | Out-Null
+[void]$script:Grid.Columns.Add($colChk)
 
-$Grid.Columns.Add("Username", "Username") | Out-Null
-$Grid.Columns.Add("LastLogin", "Last Login Date") | Out-Null
-$Grid.Columns.Add("SizeGB", "Size (GB)") | Out-Null
-$Grid.Columns.Add("Path", "Profile Path") | Out-Null
-$Grid.Columns.Add("SID", "SID") | Out-Null
+[void]$script:Grid.Columns.Add("Username", "Username")
+[void]$script:Grid.Columns.Add("LastLogin", "Last Login Date")
+[void]$script:Grid.Columns.Add("SizeGB", "Size (GB)")
+[void]$script:Grid.Columns.Add("Path", "Profile Path")
+[void]$script:Grid.Columns.Add("SID", "SID")
 
-$Grid.Columns["Username"].ReadOnly = $true
-$Grid.Columns["LastLogin"].ReadOnly = $true
-$Grid.Columns["SizeGB"].ReadOnly = $true
-$Grid.Columns["Path"].ReadOnly = $true
-$Grid.Columns["SID"].ReadOnly = $true
-$Grid.Columns["SID"].Visible = $false
+$script:Grid.Columns["Username"].ReadOnly = $true
+$script:Grid.Columns["LastLogin"].ReadOnly = $true
+$script:Grid.Columns["SizeGB"].ReadOnly = $true
+$script:Grid.Columns["Path"].ReadOnly = $true
+$script:Grid.Columns["SID"].ReadOnly = $true
+$script:Grid.Columns["SID"].Visible = $false
 
-$Form.Controls.Add($Grid)
+$script:Form.Controls.Add($script:Grid)
 
 # --- BOTTOM GROUP (Actions & Settings) ---
 $GroupAction = New-Object System.Windows.Forms.GroupBox
@@ -123,17 +123,17 @@ $lblBackupDir.Location = New-Object System.Drawing.Point(15, 28)
 $lblBackupDir.AutoSize =$true
 $GroupAction.Controls.Add($lblBackupDir)
 
-$txtBackupDir = New-Object System.Windows.Forms.TextBox
-$txtBackupDir.Text = "C:\ProfileBackups"
-$txtBackupDir.Location = New-Object System.Drawing.Point(210, 25)$txtBackupDir.Size = New-Object System.Drawing.Size(220, 23)
-$GroupAction.Controls.Add($txtBackupDir)
+$script:txtBackupDir = New-Object System.Windows.Forms.TextBox
+$script:txtBackupDir.Text = "C:\ProfileBackups"
+$script:txtBackupDir.Location = New-Object System.Drawing.Point(210, 25)$script:txtBackupDir.Size = New-Object System.Drawing.Size(220, 23)
+$GroupAction.Controls.Add($script:txtBackupDir)
 
 # Dry Run Checkbox
-$chkDryRun = New-Object System.Windows.Forms.CheckBox
-$chkDryRun.Text = "Dry Run Mode (Simulate actions only)"
-$chkDryRun.Checked =$true
-$chkDryRun.Location = New-Object System.Drawing.Point(15, 55)$chkDryRun.AutoSize = $true$chkDryRun.Font = New-Object System.Drawing.Font($chkDryRun.Font, [System.Drawing.FontStyle]::Bold)$chkDryRun.ForeColor = [System.Drawing.Color]::DarkBlue
-$GroupAction.Controls.Add($chkDryRun)
+$script:chkDryRun = New-Object System.Windows.Forms.CheckBox
+$script:chkDryRun.Text = "Dry Run Mode (Simulate actions only)"
+$script:chkDryRun.Checked =$true
+$script:chkDryRun.Location = New-Object System.Drawing.Point(15, 55)$script:chkDryRun.AutoSize = $true$script:chkDryRun.Font = New-Object System.Drawing.Font($script:chkDryRun.Font, [System.Drawing.FontStyle]::Bold)$script:chkDryRun.ForeColor = [System.Drawing.Color]::DarkBlue
+$GroupAction.Controls.Add($script:chkDryRun)
 
 # Action Buttons
 $btnBackup = New-Object System.Windows.Forms.Button
@@ -153,14 +153,14 @@ $btnBackupDelete.Location = New-Object System.Drawing.Point(750, 25)$btnBackupDe
 $btnBackupDelete.Font = New-Object System.Drawing.Font($btnBackupDelete.Font, [System.Drawing.FontStyle]::Bold)
 $GroupAction.Controls.Add($btnBackupDelete)
 
-$Form.Controls.Add($GroupAction)
+$script:Form.Controls.Add($GroupAction)
 
 # --- STATUS BAR ---
-$StatusBar = New-Object System.Windows.Forms.StatusStrip
-$StatusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
-$StatusLabel.Text = "Ready"
-$StatusBar.Items.Add($StatusLabel) | Out-Null
-$Form.Controls.Add($StatusBar)
+$script:StatusBar = New-Object System.Windows.Forms.StatusStrip
+$script:StatusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
+$script:StatusLabel.Text = "Ready"
+[void]$script:StatusBar.Items.Add($script:StatusLabel)
+$script:Form.Controls.Add($script:StatusBar)
 
 
 # ==========================================
@@ -168,23 +168,35 @@ $Form.Controls.Add($StatusBar)
 # ==========================================
 
 # Helper: Update Status Text
-function Set-Status ($Text) {$StatusLabel.Text = $Text$StatusBar.Refresh()
+function Set-Status ([string]$Text) {$script:StatusLabel.Text = $Text$script:StatusBar.Refresh()
     [System.Windows.Forms.Application]::DoEvents()
+}
+
+# Helper: Get Selected Rows safely
+function Get-SelectedRows {
+    $selected = @()
+    foreach ($row in$script:Grid.Rows) {
+        $val =$row.Cells["Select"].Value
+        if ($null -ne$val -and [bool]$val -eq$true) {
+            $selected +=$row
+        }
+    }
+    return $selected
 }
 
 # 1. SCAN PROFILES
 $btnScan.Add_Click({
-    $Computer =$txtComp.Text.Trim()
-    $Days = [int]$numDays.Value
+    $Computer =$script:txtComp.Text.Trim()
+    $Days = [int]$script:numDays.Value
     
     if ([string]::IsNullOrWhiteSpace($Computer)) {
         [System.Windows.Forms.MessageBox]::Show("Please enter a valid computer name.", "Error", "OK", "Error")
         return
     }
 
-    $Grid.Rows.Clear()
+    $script:Grid.Rows.Clear()
     Set-Status "Scanning $Computer for profiles older than$Days days... Please wait."
-    $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
 
     $ScanScript = {
         param([int]$CutoffDays)
@@ -219,9 +231,10 @@ $btnScan.Add_Click({
         }
 
         if ($Results) {
-            foreach ($item in $Results) {$Grid.Rows.Add($false,$item.Username, $item.LastUseTime, $item.SizeGB, $item.LocalPath, $item.SID) | Out-Null
+            foreach ($item in$Results) {
+                [void]$script:Grid.Rows.Add($false,$item.Username, $item.LastUseTime, $item.SizeGB, $item.LocalPath, $item.SID)
             }
-            Set-Status "Scan complete: Found $($Grid.Rows.Count) stale profile(s)."
+            Set-Status "Scan complete: Found $($script:Grid.Rows.Count) stale profile(s)."
         } else {
             Set-Status "Scan complete: No stale user profiles found."
         }
@@ -231,30 +244,25 @@ $btnScan.Add_Click({
         Set-Status "Scan failed."
     }
     finally {
-        $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
 })
 
 # 2. SELECT / DESELECT ALL
 $btnSelectAll.Add_Click({
-    foreach ($row in$Grid.Rows) { $row.Cells["Select"].Value = $true }
+    foreach ($row in$script:Grid.Rows) { $row.Cells["Select"].Value = $true }
 })
 
 $btnDeselectAll.Add_Click({
-    foreach ($row in$Grid.Rows) { $row.Cells["Select"].Value = $false }
+    foreach ($row in$script:Grid.Rows) { $row.Cells["Select"].Value = $false }
 })
-
-# Helper: Get Selected Rows
-function Get-SelectedRows {
-    return @($Grid.Rows | Where-Object { $_.Cells["Select"].Value -eq $true })
-}
 
 # 3. BACKUP ACTION
 function Invoke-ProfileBackup ($SelectedRows) {
-    $Computer =$txtComp.Text.Trim()
-    $BackupDir =$txtBackupDir.Text.Trim()
-    $SevenZipExe =$txt7z.Text.Trim()
-    $IsDryRun =$chkDryRun.Checked
+    $Computer =$script:txtComp.Text.Trim()
+    $BackupDir =$script:txtBackupDir.Text.Trim()
+    $SevenZipExe =$script:txt7z.Text.Trim()
+    $IsDryRun =$script:chkDryRun.Checked
 
     $BackupScript = {
         param([string]$Path, [string]$ZipPath, [string]$ExePath)
@@ -276,4 +284,118 @@ function Invoke-ProfileBackup ($SelectedRows) {
         $TimeStamp = Get-Date -Format "yyyyMMdd_HHmmss"
         $ZipPath = "$BackupDir\${User}_Backup_${TimeStamp}.7z"
 
-        if ($IsDryRun)
+        if ($IsDryRun) {
+            Set-Status "[DRY RUN] Would backup '$User' to '$ZipPath'"
+            Start-Sleep -Milliseconds 300
+            $SuccessCount++
+        } else {
+            Set-Status "Backing up $User to$ZipPath..."
+            try {
+                if ($Computer -match "^(localhost|127\.0\.0\.1|$env:COMPUTERNAME)$") {
+                    $ok = & $BackupScript -Path$Path -ZipPath $ZipPath -ExePath$SevenZipExe
+                } else {
+                    $ok = Invoke-Command -ComputerName$Computer -ScriptBlock $BackupScript -ArgumentList$Path, $ZipPath,$SevenZipExe -ErrorAction Stop
+                }
+                if ($ok) {$SuccessCount++ }
+            }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show("Backup failed for $User: $($_.Exception.Message)", "Backup Error", "OK", "Error")
+            }
+        }
+    }
+    return $SuccessCount
+}
+
+# 4. DELETE ACTION
+function Invoke-ProfileDelete ($SelectedRows) {
+    $Computer =$script:txtComp.Text.Trim()
+    $IsDryRun =$script:chkDryRun.Checked
+
+    $DeleteScript = {
+        param([string]$TargetSID)$profile = Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.SID -eq$TargetSID }
+        if ($profile) {
+            Remove-CimInstance -InputObject $profile -ErrorAction Stop
+            return $true
+        }
+        return $false
+    }
+
+    $RowsToRemove = @()
+    foreach ($row in$SelectedRows) {
+        $User =$row.Cells["Username"].Value
+        $SID =$row.Cells["SID"].Value
+
+        if ($IsDryRun) {
+            Set-Status "[DRY RUN] Would delete CIM profile for '$User' (SID:$SID)"
+            Start-Sleep -Milliseconds 300
+            $RowsToRemove +=$row
+        } else {
+            Set-Status "Deleting profile $User..."
+            try {
+                if ($Computer -match "^(localhost|127\.0\.0\.1|$env:COMPUTERNAME)$") {
+                    & $DeleteScript -TargetSID$SID | Out-Null
+                } else {
+                    Invoke-Command -ComputerName $Computer -ScriptBlock $DeleteScript -ArgumentList$SID -ErrorAction Stop | Out-Null
+                }
+                $RowsToRemove +=$row
+            }
+            catch {
+                [System.Windows.Forms.MessageBox]::Show("Deletion failed for $User: $($_.Exception.Message)", "Delete Error", "OK", "Error")
+            }
+        }
+    }
+
+    # Remove deleted rows from UI
+    foreach ($r in$RowsToRemove) {
+        $script:Grid.Rows.Remove($r)
+    }
+    return $RowsToRemove.Count
+}
+
+# BUTTON CLICK HANDLERS
+$btnBackup.Add_Click({$Selected = Get-SelectedRows
+    if ($Selected.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Please select at least one profile.", "Notice", "OK", "Information")
+        return
+    }
+    $count = Invoke-ProfileBackup$Selected
+    Set-Status "Backup completed for $count profile(s)."
+})
+
+$btnDelete.Add_Click({$Selected = Get-SelectedRows
+    if ($Selected.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Please select at least one profile.", "Notice", "OK", "Information")
+        return
+    }
+
+    $msg = "Are you sure you want to PERMANENTLY delete $($Selected.Count) selected profile(s)?"
+    if ($script:chkDryRun.Checked) {$msg = "[DRY RUN] Simulate deletion of $($Selected.Count) profile(s)?" }
+    
+    $confirm = [System.Windows.Forms.MessageBox]::Show($msg, "Confirm Deletion", "YesNo", "Warning")
+    if ($confirm -eq "Yes") {
+        $count = Invoke-ProfileDelete$Selected
+        Set-Status "Deletion completed for $count profile(s)."
+    }
+})
+
+$btnBackupDelete.Add_Click({$Selected = Get-SelectedRows
+    if ($Selected.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Please select at least one profile.", "Notice", "OK", "Information")
+        return
+    }
+
+    $msg = "Backup AND Delete $($Selected.Count) selected profile(s)?"
+    if ($script:chkDryRun.Checked) {$msg = "[DRY RUN] Simulate Backup & Delete of $($Selected.Count) profile(s)?" }
+
+    $confirm = [System.Windows.Forms.MessageBox]::Show($msg, "Confirm Action", "YesNo", "Question")
+    if ($confirm -eq "Yes") {
+        $backedUp = Invoke-ProfileBackup$Selected
+        if ($backedUp -gt 0) {
+            $deleted = Invoke-ProfileDelete$Selected
+            Set-Status "Completed Backup ($backedUp) & Deletion ($deleted)."
+        }
+    }
+})
+
+# SHOW FORM
+[void]$script:Form.ShowDialog()
