@@ -4,7 +4,10 @@ Dry run mode is enabled by default. Nothing is archived or deleted until you unt
 ---
 Features
 WinForms GUI: scan, review, tick/untick profiles, run.
-Staleness is based on the newer of two signals: `Win32_UserProfile.LastUseTime` and the `NTUSER.DAT` last-write time. `LastUseTime` alone is unreliable, so this errs on the side of keeping profiles.
+Staleness basis is selectable (Idle time based on). Default is LastUseTime only (the `Win32_UserProfile.LastUseTime` value). If that value looks wrong on your PCs (Windows updates, AV and backup agents can reset it to "today"), switch to User activity files: the newest of (a) files in Desktop/Documents/Downloads, (b) the Recent items folder, (c) Chrome/Edge/Firefox history and Outlook OST files. These only change when a real person uses the profile on that PC. Hive timestamps (`LastUseTime`, `NTUSER.DAT`) are ignored by this mode because Windows updates, AV and backup agents that load profile hives reset them to "today". If no activity evidence exists at all, the profile folder's creation date is used. Other options: newest of all signals (safest; includes the home folder date), `NTUSER.DAT` only, and the home folder's last-modified date only.
+Domain `lastLogon` is intentionally not used: it is domain-wide, so a logon on another PC would hide a stale profile here.
+The grid shows every signal side by side (including the last-modified date of the profile/home folder itself) plus which one decided the result. The SID is not displayed. Evidence is collected on the remote PC over WinRM, so it doesn't depend on the `C$` share. Export grid to CSV saves the table for review.
+Profiles whose registry entry exists but whose folder is gone are shown as `Orphaned (profile folder missing)` and are not selectable.
 7-Zip runs on the remote PC (PowerShell remoting). Profile data does not travel over the network, and archives are stored on the remote PC.
 A profile is deleted only if its archive was created cleanly (7z exit code 0) and passed `7z t` (integrity test).
 Deletion uses `Remove-CimInstance` on `Win32_UserProfile`, which removes both the folder and the registry entry.
@@ -19,7 +22,7 @@ Account	Local administrator on the remote PC (current login or entered via Crede
 Remote PC	WinRM enabled (`Enable-PSRemoting -Force`) for the backup step. Scanning and deletion fall back to DCOM, but the backup does not.
 7-Zip	Installed on the remote PC, or a local `7z.exe` / standalone `7za.exe` that the script copies to the remote temp folder and removes afterwards
 Disk space	Enough free space on the remote backup drive for the archives
-Admin share	`C$` access is only used to read `NTUSER.DAT` dates during the scan. If it is unreachable, those dates show as `-` and `LastUseTime` is used alone.
+Admin share	`C$` access is only a fallback for reading `NTUSER.DAT` dates if remote evidence collection over WinRM fails.
 Running the script
 If Windows blocks it with a "not digitally signed" error, use one of these:
 ```powershell
@@ -50,9 +53,10 @@ Status	Meaning
 `Active`	Used within the threshold; not selected
 `Loaded / in use - skipped`	A user is currently logged on; cannot be selected
 `Excluded by name`	On the "Never touch" list; cannot be selected
+`Orphaned (profile folder missing)`	Registry entry exists but the folder is gone; cannot be selected
 `No date found - review manually`	No usable timestamp; not pre-selected
 Safety behavior
-Special/system profiles are ignored.
+Special/system profiles are ignored, and only profiles whose path contains `\Users\` are listed.
 Loaded profiles are skipped, and this is re-checked immediately before each profile is processed.
 The backup folder cannot be inside a profile selected for deletion.
 If 7-Zip returns anything other than exit code 0 (including code 1, "warning", typically locked files), the profile is kept.
@@ -70,7 +74,10 @@ Troubleshooting
 Problem	Fix
 "Cannot open a PowerShell remoting session"	Run `Enable-PSRemoting -Force` on the target; check the firewall allows WinRM (TCP 5985); for non-domain PCs, add the target to `TrustedHosts`
 "7-Zip not found ... and no valid local 7z/7za.exe"	Install 7-Zip on the target, correct the path, or browse to a local `7za.exe`
-NTUSER.DAT dates show `-`	`C$` share not reachable; the scan still works using `LastUseTime`
+Many profiles show today's date in `LastUseTime` / `NTUSER.DAT`	Expected: Windows, AV or backup agents reset them. Switch to the User activity files basis, which ignores them
+Many profiles show "No date found"	Evidence couldn't be read. Make sure WinRM works (it is collected remotely); the scan falls back to the `C$` share (NTUSER.DAT only) otherwise. Use Export grid to CSV to inspect the signals
+`Orphaned (profile folder missing)`	Stale registry entry with no folder. Not selectable; nothing to back up
+NTUSER.DAT dates show `-`	Remoting and `C$` both failed for that profile, or the file is missing
 "Backup NOT clean" with exit code 1	Some files were locked or unreadable. The profile is kept; retry later or investigate the 7z output in the log
 "Deleted (leftovers)"	The profile registration was removed but some files remain in the folder; remove them manually
 Script blocked as unsigned	See Running the script
