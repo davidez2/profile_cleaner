@@ -170,6 +170,24 @@ $sbExists   = { param($Path) Test-Path -LiteralPath $Path }
 $sbMkTemp   = { $d = Join-Path $env:TEMP ('7z_' + [guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $d | Out-Null; $d }
 $sbRmTemp   = { param($Path) Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue }
 $sbRmFile   = { param($Path) Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+$sbSignals  = {
+    # Collects every timestamp we can use as a "last activity" signal, ON the remote PC (no SMB needed)
+    param($Items)
+    $u32 = { param($v) [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$v), 0) }
+    foreach ($i in $Items) {
+        $nt = $null; $uc = $null; $un = $null
+        try { $nt = (Get-Item -LiteralPath (Join-Path $i.Path 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { }
+        try { $uc = (Get-Item -LiteralPath (Join-Path $i.Path 'AppData\Local\Microsoft\Windows\UsrClass.dat') -Force -ErrorAction Stop).LastWriteTime } catch { }
+        try {
+            $k = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($i.SID)" -ErrorAction Stop
+            if ($k.LocalProfileUnloadTimeHigh -or $k.LocalProfileUnloadTimeLow) {
+                $ft = ([int64](& $u32 $k.LocalProfileUnloadTimeHigh) -shl 32) -bor [int64](& $u32 $k.LocalProfileUnloadTimeLow)
+                if ($ft -gt 0) { $un = [DateTime]::FromFileTime($ft) }
+            }
+        } catch { }
+        [pscustomobject]@{ SID = $i.SID; NTUSER = $nt; UsrClass = $uc; Unload = $un }
+    }
+}
 
 function Set-Busy {
     param([bool]$Busy)
@@ -180,6 +198,49 @@ function Set-Busy {
 }
 
 function Format-Size($b) { if ($null -eq $b) { '?' } elseif ($b -ge 1GB) { '{0:N1} GB' -f ($b / 1GB) } else { '{0:N0} MB' -f ($b / 1MB) } }
+
+function Format-Date($d) { if ($d) { ([datetime]$d).ToString('yyyy-MM-dd HH:mm') } else { '-' } }
+
+function Get-AdLastLogon {
+    # Domain accounts only: lastLogonTimestamp from AD (replicates every ~14 days, fine for a 90-day test)
+    param([string]$Sid)
+    try {
+        $s = [adsisearcher]"(objectSid=$Sid)"
+        [void]$s.PropertiesToLoad.Add('lastlogontimestamp')
+        $r = $s.FindOne()
+        if ($r -and $r.Properties['lastlogontimestamp'].Count) { return [DateTime]::FromFileTime([int64]$r.Properties['lastlogontimestamp'][0]) }
+    } catch { }
+    return $null
+}
+
+function Get-LastActivity {
+    # Returns @{ Time = <datetime or $null>; Source = <text> } according to the chosen basis
+    param([string]$Basis, $LastUse, $Ntuser, $UsrClass, $Unload, $Ad)
+    switch -Wildcard ($Basis) {
+        'NTUSER*' {
+            if ($Ntuser)   { return @{ Time = $Ntuser;   Source = 'NTUSER.DAT' } }
+            if ($UsrClass) { return @{ Time = $UsrClass; Source = 'UsrClass.dat' } }
+            if ($LastUse)  { return @{ Time = $LastUse;  Source = 'LastUseTime (fallback)' } }
+            return @{ Time = $null; Source = 'none' }
+        }
+        'LastUseTime*' {
+            if ($LastUse) { return @{ Time = $LastUse; Source = 'LastUseTime' } }
+            return @{ Time = $null; Source = 'none' }
+        }
+        'AD*' {
+            if ($Ad)     { return @{ Time = $Ad;     Source = 'AD lastLogon' } }
+            if ($Ntuser) { return @{ Time = $Ntuser; Source = 'NTUSER.DAT (no AD data)' } }
+            return @{ Time = $null; Source = 'none' }
+        }
+        default {   # newest of everything = safest
+            $best = $null; $src = 'none'
+            foreach ($c in @(@($LastUse, 'LastUseTime'), @($Ntuser, 'NTUSER.DAT'), @($UsrClass, 'UsrClass.dat'), @($Unload, 'Profile unload'), @($Ad, 'AD lastLogon'))) {
+                if ($c[0] -and (-not $best -or $c[0] -gt $best)) { $best = $c[0]; $src = $c[1] }
+            }
+            return @{ Time = $best; Source = $src }
+        }
+    }
+}
 
 # ----------------------------------------------------------------- scan
 function Start-Scan {
@@ -202,6 +263,23 @@ function Start-Scan {
         $profiles | ForEach-Object { $_.LocalPath.Substring(0, 1) } | Select-Object -Unique |
             ForEach-Object { Connect-Share -Computer $computer -DriveLetter $_ }
 
+        $basis = [string]$cmbBasis.SelectedItem
+        $useAD = $chkAD.Checked
+
+        # Collect timestamps ON the remote PC in one call (more reliable than reading C$ file by file)
+        $signals = @{}
+        try {
+            Get-PSConn -Computer $computer
+            $items = @($profiles | ForEach-Object { @{ SID = $_.SID; Path = $_.LocalPath } })
+            $res = Invoke-Remote -Script $sbSignals -ArgList @(, $items)
+            foreach ($r in @($res)) { $signals[$r.SID] = $r }
+            Write-Log "Collected profile timestamps remotely for $($signals.Count) profile(s)."
+        } catch {
+            Write-Log "Remote timestamp collection failed ($($_.Exception.Message.Trim())). Falling back to the C$ share (NTUSER.DAT only)." 'WARN'
+        }
+        if ($script:Cancel) { return }
+
+        Write-Log "Staleness basis: $basis"
         $now = Get-Date
         foreach ($p in $profiles) {
             [System.Windows.Forms.Application]::DoEvents()
@@ -209,10 +287,16 @@ function Start-Scan {
             $unc  = ConvertTo-UncPath -Computer $computer -LocalPath $p.LocalPath
 
             $lastUse = $p.LastUseTime
-            $ntuser  = $null
-            try { $ntuser = (Get-Item -LiteralPath (Join-Path $unc 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { }
+            $sig = $signals[$p.SID]
+            $ntuser = $null; $usrcls = $null; $unload = $null
+            if ($sig) { $ntuser = $sig.NTUSER; $usrcls = $sig.UsrClass; $unload = $sig.Unload }
+            else { try { $ntuser = (Get-Item -LiteralPath (Join-Path $unc 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { } }
 
-            $last = @($lastUse, $ntuser) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+            $adLogon = $null
+            if (($useAD -or $basis -like 'AD*') -and $p.SID -like 'S-1-5-21-*') { $adLogon = Get-AdLastLogon -Sid $p.SID }
+
+            $act  = Get-LastActivity -Basis $basis -LastUse $lastUse -Ntuser $ntuser -UsrClass $usrcls -Unload $unload -Ad $adLogon
+            $last = $act.Time
             $days = if ($last) { [int]($now - $last).TotalDays } else { $null }
 
             $select = $false
@@ -226,10 +310,11 @@ function Start-Scan {
 
             [void]$grid.Rows.Add(
                 $select, $name, $p.SID,
-                $(if ($lastUse) { $lastUse.ToString('yyyy-MM-dd HH:mm') } else { '-' }),
-                $(if ($ntuser)  { $ntuser.ToString('yyyy-MM-dd HH:mm') }  else { '-' }),
+                (Format-Date $lastUse),
+                (Format-Date $ntuser),
                 $(if ($null -ne $days) { $days } else { '?' }),
-                $status)
+                $status,
+                (Format-Date $usrcls), (Format-Date $unload), (Format-Date $adLogon), $act.Source)
 
             $row = $grid.Rows[$grid.Rows.Count - 1]
             if ($status -eq 'STALE') { $row.DefaultCellStyle.BackColor = [Drawing.Color]::MistyRose }
@@ -326,7 +411,7 @@ function Start-Cleanup {
                 if ($script:Cancel) { Write-Log 'Cancelled by user.' 'WARN'; break }
                 $totalEst += [double]$size
                 Write-Log "[DRY RUN] [$name] size on disk: $(Format-Size $size)"
-                Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer : $($info.LocalPath)  ->  $archive"
+                Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer: $($info.LocalPath)  ->  $archive"
                 Write-Log "[DRY RUN] [$name] would test the archive, then delete the profile (SID $sid)"
                 $row.Cells[6].Value = 'Dry run OK'
                 $ok++
@@ -449,6 +534,13 @@ $btnScan = New-Object Windows.Forms.Button; $btnScan.Text = '1. Scan'; $btnScan.
 $btnRun  = New-Object Windows.Forms.Button; $btnRun.Text = '2. Run selected'; $btnRun.Location = '130,206'; $btnRun.Size = '140,30'; $form.Controls.Add($btnRun)
 $btnCancel = New-Object Windows.Forms.Button; $btnCancel.Text = 'Cancel'; $btnCancel.Location = '278,206'; $btnCancel.Size = '90,30'; $btnCancel.Enabled = $false; $form.Controls.Add($btnCancel)
 
+[void](New-Label 'Idle time based on:' 385 210 110)
+$cmbBasis = New-Object Windows.Forms.ComboBox; $cmbBasis.Location = '497,209'; $cmbBasis.Size = '270,24'; $cmbBasis.DropDownStyle = 'DropDownList'
+[void]$cmbBasis.Items.AddRange(@('NTUSER.DAT (recommended)', 'Newest of all signals (safest)', 'LastUseTime only (unreliable)', 'AD lastLogon (domain users)'))
+$cmbBasis.SelectedIndex = 0
+$form.Controls.Add($cmbBasis)
+$chkAD = New-Object Windows.Forms.CheckBox; $chkAD.Text = 'Also query AD'; $chkAD.Location = '777,208'; $chkAD.Size = '150,26'; $form.Controls.Add($chkAD)
+
 # Grid
 $grid = New-Object Windows.Forms.DataGridView
 $grid.Location = '12,244'; $grid.Size = '943,240'; $grid.Anchor = 'Top,Left,Right'
@@ -456,11 +548,12 @@ $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false; $grid.R
 $grid.SelectionMode = 'FullRowSelect'; $grid.AutoSizeColumnsMode = 'Fill'; $grid.BackgroundColor = [Drawing.Color]::White
 $colSel = New-Object Windows.Forms.DataGridViewCheckBoxColumn; $colSel.HeaderText = 'Select'; $colSel.FillWeight = 40
 [void]$grid.Columns.Add($colSel)
-foreach ($c in @(@('User', 90), @('SID', 150), @('LastUseTime (WMI)', 90), @('NTUSER.DAT modified', 90), @('Days idle', 50), @('Status', 120))) {
+foreach ($c in @(@('User', 90), @('SID', 150), @('LastUseTime (WMI)', 90), @('NTUSER.DAT modified', 90), @('Days idle', 50), @('Status', 120), @('UsrClass.dat', 90), @('Profile unload', 90), @('AD lastLogon', 90), @('Basis used', 90))) {
     $col = New-Object Windows.Forms.DataGridViewTextBoxColumn; $col.HeaderText = $c[0]; $col.FillWeight = $c[1]; $col.ReadOnly = $true
     [void]$grid.Columns.Add($col)
 }
 $form.Controls.Add($grid)
+$grid.Columns[6].DisplayIndex = $grid.Columns.Count - 1   # keep Status as the last visible column
 
 # Log
 $txtLog = New-Object Windows.Forms.TextBox
