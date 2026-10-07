@@ -4,8 +4,10 @@
     GUI tool: find stale user profiles on a remote PC, back them up with 7-Zip ON THAT PC, then delete them.
 
 .DESCRIPTION
-    - Scan: lists profiles via CIM (WinRM with DCOM fallback). Last activity = the newer of
-      Win32_UserProfile.LastUseTime and the NTUSER.DAT last-write time (read over the C$ share).
+    - Scan: lists profiles via CIM (WinRM with DCOM fallback). Last activity is judged by a selectable basis;
+      the default ("User activity files") uses the newest user-created files, Recent items and browser/Outlook
+      activity, because hive timestamps (LastUseTime, NTUSER.DAT) are often reset by system services.
+      Evidence is collected on the remote PC over WinRM (the C$ share is only a fallback).
     - Backup: 7-Zip runs ON THE REMOTE PC (PowerShell remoting / WinRM) against the local profile folder
       and writes the .7z archive to a folder on the remote PC. No profile data crosses the network.
     - A profile is deleted only if its archive was created AND passed "7z t".
@@ -171,13 +173,36 @@ $sbMkTemp   = { $d = Join-Path $env:TEMP ('7z_' + [guid]::NewGuid().ToString('N'
 $sbRmTemp   = { param($Path) Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue }
 $sbRmFile   = { param($Path) Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
 $sbSignals  = {
-    # Collects every timestamp we can use as a "last activity" signal, ON the remote PC (no SMB needed)
+    # Collects "last activity" evidence ON the remote PC (no SMB needed).
+    # Hive timestamps (NTUSER.DAT, LastUseTime, unload time) can be touched by system services, so we also
+    # look for things only a real user session produces: files they saved, Recent items, browser/Outlook activity.
     param($Items)
     $u32 = { param($v) [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$v), 0) }
+    function Get-Newest {
+        param([string]$Path, [string]$Filter = '*', [int]$Depth = 0)
+        if (-not (Test-Path -LiteralPath $Path)) { return $null }
+        $g = @{ LiteralPath = $Path; Force = $true; File = $true; ErrorAction = 'SilentlyContinue' }
+        if ($Depth -gt 0) { $g.Recurse = $true; $g.Depth = $Depth }
+        if ($Filter -ne '*') { $g.Filter = $Filter }
+        (Get-ChildItem @g | Measure-Object LastWriteTime -Maximum).Maximum
+    }
+    function Get-Max { $v = @($args | Where-Object { $_ }); if ($v.Count) { ($v | Measure-Object -Maximum).Maximum } else { $null } }
     foreach ($i in $Items) {
-        $nt = $null; $uc = $null; $un = $null
-        try { $nt = (Get-Item -LiteralPath (Join-Path $i.Path 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { }
-        try { $uc = (Get-Item -LiteralPath (Join-Path $i.Path 'AppData\Local\Microsoft\Windows\UsrClass.dat') -Force -ErrorAction Stop).LastWriteTime } catch { }
+        $P = $i.Path
+        $exists = Test-Path -LiteralPath $P
+        $nt = $null; $un = $null; $created = $null
+        if ($exists) {
+            try { $created = (Get-Item -LiteralPath $P -Force -ErrorAction Stop).CreationTime } catch { }
+            try { $nt = (Get-Item -LiteralPath (Join-Path $P 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { }
+        }
+        $userFiles = if ($exists) { Get-Max (Get-Newest (Join-Path $P 'Desktop') '*' 3) (Get-Newest (Join-Path $P 'Documents') '*' 3) (Get-Newest (Join-Path $P 'Downloads') '*' 2) } else { $null }
+        $recent    = if ($exists) { Get-Max (Get-Newest (Join-Path $P 'AppData\Roaming\Microsoft\Windows\Recent') '*' 1) } else { $null }
+        $apps      = if ($exists) {
+            Get-Max (Get-Newest (Join-Path $P 'AppData\Local\Google\Chrome\User Data\Default') 'History' 0) `
+                    (Get-Newest (Join-Path $P 'AppData\Local\Microsoft\Edge\User Data\Default') 'History' 0) `
+                    (Get-Newest (Join-Path $P 'AppData\Roaming\Mozilla\Firefox\Profiles') 'places.sqlite' 2) `
+                    (Get-Newest (Join-Path $P 'AppData\Local\Microsoft\Outlook') '*.ost' 0)
+        } else { $null }
         try {
             $k = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($i.SID)" -ErrorAction Stop
             if ($k.LocalProfileUnloadTimeHigh -or $k.LocalProfileUnloadTimeLow) {
@@ -185,7 +210,7 @@ $sbSignals  = {
                 if ($ft -gt 0) { $un = [DateTime]::FromFileTime($ft) }
             }
         } catch { }
-        [pscustomobject]@{ SID = $i.SID; NTUSER = $nt; UsrClass = $uc; Unload = $un }
+        [pscustomobject]@{ SID = $i.SID; FolderExists = $exists; Created = $created; NTUSER = $nt; Unload = $un; UserFiles = $userFiles; Recent = $recent; Apps = $apps }
     }
 }
 
@@ -201,43 +226,27 @@ function Format-Size($b) { if ($null -eq $b) { '?' } elseif ($b -ge 1GB) { '{0:N
 
 function Format-Date($d) { if ($d) { ([datetime]$d).ToString('yyyy-MM-dd HH:mm') } else { '-' } }
 
-function Get-AdLastLogon {
-    # Domain accounts only: lastLogonTimestamp from AD (replicates every ~14 days, fine for a 90-day test)
-    param([string]$Sid)
-    try {
-        $s = [adsisearcher]"(objectSid=$Sid)"
-        [void]$s.PropertiesToLoad.Add('lastlogontimestamp')
-        $r = $s.FindOne()
-        if ($r -and $r.Properties['lastlogontimestamp'].Count) { return [DateTime]::FromFileTime([int64]$r.Properties['lastlogontimestamp'][0]) }
-    } catch { }
-    return $null
-}
-
 function Get-LastActivity {
-    # Returns @{ Time = <datetime or $null>; Source = <text> } according to the chosen basis
-    param([string]$Basis, $LastUse, $Ntuser, $UsrClass, $Unload, $Ad)
+    # Returns @{ Time = <datetime or $null>; Source = <text> } for the chosen basis.
+    # $S is a hashtable: NTUSER, Unload, UserFiles, Recent, Apps, Created
+    param([string]$Basis, [hashtable]$S, $LastUse)
+    function Pick($cands) {
+        $best = $null; $src = 'none'
+        foreach ($c in $cands) { if ($c[0] -and (-not $best -or $c[0] -gt $best)) { $best = $c[0]; $src = $c[1] } }
+        return @{ Time = $best; Source = $src }
+    }
     switch -Wildcard ($Basis) {
-        'NTUSER*' {
-            if ($Ntuser)   { return @{ Time = $Ntuser;   Source = 'NTUSER.DAT' } }
-            if ($UsrClass) { return @{ Time = $UsrClass; Source = 'UsrClass.dat' } }
-            if ($LastUse)  { return @{ Time = $LastUse;  Source = 'LastUseTime (fallback)' } }
-            return @{ Time = $null; Source = 'none' }
+        'User activity*' {
+            # Evidence of a real person using the profile. Hive timestamps are deliberately ignored.
+            $r = Pick @(@($S.UserFiles, 'User files'), @($S.Recent, 'Recent items'), @($S.Apps, 'Browser/Outlook'))
+            if (-not $r.Time -and $S.Created) { return @{ Time = $S.Created; Source = 'Profile created (no activity found)' } }
+            return $r
         }
-        'LastUseTime*' {
-            if ($LastUse) { return @{ Time = $LastUse; Source = 'LastUseTime' } }
-            return @{ Time = $null; Source = 'none' }
-        }
-        'AD*' {
-            if ($Ad)     { return @{ Time = $Ad;     Source = 'AD lastLogon' } }
-            if ($Ntuser) { return @{ Time = $Ntuser; Source = 'NTUSER.DAT (no AD data)' } }
-            return @{ Time = $null; Source = 'none' }
-        }
-        default {   # newest of everything = safest
-            $best = $null; $src = 'none'
-            foreach ($c in @(@($LastUse, 'LastUseTime'), @($Ntuser, 'NTUSER.DAT'), @($UsrClass, 'UsrClass.dat'), @($Unload, 'Profile unload'), @($Ad, 'AD lastLogon'))) {
-                if ($c[0] -and (-not $best -or $c[0] -gt $best)) { $best = $c[0]; $src = $c[1] }
-            }
-            return @{ Time = $best; Source = $src }
+        'NTUSER*'      { return (Pick @(, @($S.NTUSER, 'NTUSER.DAT'))) }
+        'LastUseTime*' { return (Pick @(, @($LastUse, 'LastUseTime'))) }
+        default {      # newest of everything, including hive timestamps = safest
+            return (Pick @(@($LastUse, 'LastUseTime'), @($S.NTUSER, 'NTUSER.DAT'), @($S.Unload, 'Profile unload'),
+                           @($S.UserFiles, 'User files'), @($S.Recent, 'Recent items'), @($S.Apps, 'Browser/Outlook')))
         }
     }
 }
@@ -264,12 +273,12 @@ function Start-Scan {
             ForEach-Object { Connect-Share -Computer $computer -DriveLetter $_ }
 
         $basis = [string]$cmbBasis.SelectedItem
-        $useAD = $chkAD.Checked
 
-        # Collect timestamps ON the remote PC in one call (more reliable than reading C$ file by file)
+        # Collect evidence ON the remote PC in one call (more reliable than reading C$ file by file)
         $signals = @{}
         try {
             Get-PSConn -Computer $computer
+            Write-Log 'Collecting activity evidence from each profile (can take a minute or two on big profiles)...'
             $items = @($profiles | ForEach-Object { @{ SID = $_.SID; Path = $_.LocalPath } })
             $res = Invoke-Remote -Script $sbSignals -ArgList @(, $items)
             foreach ($r in @($res)) { $signals[$r.SID] = $r }
@@ -288,20 +297,18 @@ function Start-Scan {
 
             $lastUse = $p.LastUseTime
             $sig = $signals[$p.SID]
-            $ntuser = $null; $usrcls = $null; $unload = $null
-            if ($sig) { $ntuser = $sig.NTUSER; $usrcls = $sig.UsrClass; $unload = $sig.Unload }
-            else { try { $ntuser = (Get-Item -LiteralPath (Join-Path $unc 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { } }
+            $s = @{ NTUSER = $null; Unload = $null; UserFiles = $null; Recent = $null; Apps = $null; Created = $null; FolderExists = $true }
+            if ($sig) { foreach ($k in @($s.Keys)) { $s[$k] = $sig.$k } }
+            else { try { $s.NTUSER = (Get-Item -LiteralPath (Join-Path $unc 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { } }
 
-            $adLogon = $null
-            if (($useAD -or $basis -like 'AD*') -and $p.SID -like 'S-1-5-21-*') { $adLogon = Get-AdLastLogon -Sid $p.SID }
-
-            $act  = Get-LastActivity -Basis $basis -LastUse $lastUse -Ntuser $ntuser -UsrClass $usrcls -Unload $unload -Ad $adLogon
+            $act  = Get-LastActivity -Basis $basis -S $s -LastUse $lastUse
             $last = $act.Time
             $days = if ($last) { [int]($now - $last).TotalDays } else { $null }
 
             $select = $false
             if ($p.Loaded)                    { $status = 'Loaded / in use - skipped' }
             elseif ($exclude -contains $name) { $status = 'Excluded by name' }
+            elseif (-not $s.FolderExists)     { $status = 'Orphaned (profile folder missing)' }
             elseif ($null -eq $days)          { $status = 'No date found - review manually' }
             elseif ($days -gt $threshold)     { $status = 'STALE'; $select = $true }
             else                              { $status = 'Active' }
@@ -311,10 +318,10 @@ function Start-Scan {
             [void]$grid.Rows.Add(
                 $select, $name, $p.SID,
                 (Format-Date $lastUse),
-                (Format-Date $ntuser),
+                (Format-Date $s.NTUSER),
                 $(if ($null -ne $days) { $days } else { '?' }),
                 $status,
-                (Format-Date $usrcls), (Format-Date $unload), (Format-Date $adLogon), $act.Source)
+                (Format-Date $s.Unload), (Format-Date $s.UserFiles), (Format-Date $s.Recent), (Format-Date $s.Apps), (Format-Date $s.Created), $act.Source)
 
             $row = $grid.Rows[$grid.Rows.Count - 1]
             if ($status -eq 'STALE') { $row.DefaultCellStyle.BackColor = [Drawing.Color]::MistyRose }
@@ -411,7 +418,7 @@ function Start-Cleanup {
                 if ($script:Cancel) { Write-Log 'Cancelled by user.' 'WARN'; break }
                 $totalEst += [double]$size
                 Write-Log "[DRY RUN] [$name] size on disk: $(Format-Size $size)"
-                Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer: $($info.LocalPath)  ->  $archive"
+                Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer : $($info.LocalPath)  ->  $archive"
                 Write-Log "[DRY RUN] [$name] would test the archive, then delete the profile (SID $sid)"
                 $row.Cells[6].Value = 'Dry run OK'
                 $ok++
@@ -536,10 +543,10 @@ $btnCancel = New-Object Windows.Forms.Button; $btnCancel.Text = 'Cancel'; $btnCa
 
 [void](New-Label 'Idle time based on:' 385 210 110)
 $cmbBasis = New-Object Windows.Forms.ComboBox; $cmbBasis.Location = '497,209'; $cmbBasis.Size = '270,24'; $cmbBasis.DropDownStyle = 'DropDownList'
-[void]$cmbBasis.Items.AddRange(@('NTUSER.DAT (recommended)', 'Newest of all signals (safest)', 'LastUseTime only (unreliable)', 'AD lastLogon (domain users)'))
+[void]$cmbBasis.Items.AddRange(@('User activity files (recommended)', 'Newest of all signals (safest)', 'NTUSER.DAT only', 'LastUseTime only (unreliable)'))
 $cmbBasis.SelectedIndex = 0
 $form.Controls.Add($cmbBasis)
-$chkAD = New-Object Windows.Forms.CheckBox; $chkAD.Text = 'Also query AD'; $chkAD.Location = '777,208'; $chkAD.Size = '150,26'; $form.Controls.Add($chkAD)
+$btnExport = New-Object Windows.Forms.Button; $btnExport.Text = 'Export grid to CSV'; $btnExport.Location = '777,206'; $btnExport.Size = '178,30'; $btnExport.Anchor = 'Top,Right'; $form.Controls.Add($btnExport)
 
 # Grid
 $grid = New-Object Windows.Forms.DataGridView
@@ -548,7 +555,7 @@ $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false; $grid.R
 $grid.SelectionMode = 'FullRowSelect'; $grid.AutoSizeColumnsMode = 'Fill'; $grid.BackgroundColor = [Drawing.Color]::White
 $colSel = New-Object Windows.Forms.DataGridViewCheckBoxColumn; $colSel.HeaderText = 'Select'; $colSel.FillWeight = 40
 [void]$grid.Columns.Add($colSel)
-foreach ($c in @(@('User', 90), @('SID', 150), @('LastUseTime (WMI)', 90), @('NTUSER.DAT modified', 90), @('Days idle', 50), @('Status', 120), @('UsrClass.dat', 90), @('Profile unload', 90), @('AD lastLogon', 90), @('Basis used', 90))) {
+foreach ($c in @(@('User', 90), @('SID', 150), @('LastUseTime (WMI)', 90), @('NTUSER.DAT modified', 90), @('Days idle', 50), @('Status', 120), @('Profile unload', 90), @('Newest user file', 90), @('Recent items', 90), @('Browser/Outlook', 90), @('Profile created', 90), @('Basis used', 110))) {
     $col = New-Object Windows.Forms.DataGridViewTextBoxColumn; $col.HeaderText = $c[0]; $col.FillWeight = $c[1]; $col.ReadOnly = $true
     [void]$grid.Columns.Add($col)
 }
@@ -575,6 +582,19 @@ $btnLocal7z.Add_Click({
 $chkDry.Add_CheckedChanged({
     $btnRun.Text = if ($chkDry.Checked) { '2. Run (dry run)' } else { '2. Run (LIVE!)' }
     $btnRun.ForeColor = if ($chkDry.Checked) { [Drawing.Color]::Black } else { [Drawing.Color]::Firebrick }
+})
+$btnExport.Add_Click({
+    if ($grid.Rows.Count -eq 0) { return }
+    $d = New-Object Windows.Forms.SaveFileDialog; $d.Filter = 'CSV|*.csv'; $d.FileName = "Profiles_$($txtComputer.Text.Trim()).csv"
+    if ($d.ShowDialog() -eq 'OK') {
+        $out = foreach ($r in $grid.Rows) {
+            $o = [ordered]@{}
+            foreach ($c in $grid.Columns) { $o[$c.HeaderText] = $r.Cells[$c.Index].Value }
+            [pscustomobject]$o
+        }
+        $out | Export-Csv -Path $d.FileName -NoTypeInformation -Encoding UTF8
+        Write-Log "Grid exported to $($d.FileName)"
+    }
 })
 $btnScan.Add_Click({ Start-Scan })
 $btnRun.Add_Click({ Start-Cleanup })
