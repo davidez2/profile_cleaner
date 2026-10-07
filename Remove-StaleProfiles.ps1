@@ -190,9 +190,9 @@ $sbSignals  = {
     foreach ($i in $Items) {
         $P = $i.Path
         $exists = Test-Path -LiteralPath $P
-        $nt = $null; $un = $null; $created = $null
+        $nt = $null; $un = $null; $created = $null; $homeMod = $null
         if ($exists) {
-            try { $created = (Get-Item -LiteralPath $P -Force -ErrorAction Stop).CreationTime } catch { }
+            try { $item = Get-Item -LiteralPath $P -Force -ErrorAction Stop; $created = $item.CreationTime; $homeMod = $item.LastWriteTime } catch { }
             try { $nt = (Get-Item -LiteralPath (Join-Path $P 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { }
         }
         $userFiles = if ($exists) { Get-Max (Get-Newest (Join-Path $P 'Desktop') '*' 3) (Get-Newest (Join-Path $P 'Documents') '*' 3) (Get-Newest (Join-Path $P 'Downloads') '*' 2) } else { $null }
@@ -210,7 +210,7 @@ $sbSignals  = {
                 if ($ft -gt 0) { $un = [DateTime]::FromFileTime($ft) }
             }
         } catch { }
-        [pscustomobject]@{ SID = $i.SID; FolderExists = $exists; Created = $created; NTUSER = $nt; Unload = $un; UserFiles = $userFiles; Recent = $recent; Apps = $apps }
+        [pscustomobject]@{ SID = $i.SID; FolderExists = $exists; Created = $created; HomeMod = $homeMod; NTUSER = $nt; Unload = $un; UserFiles = $userFiles; Recent = $recent; Apps = $apps }
     }
 }
 
@@ -243,10 +243,11 @@ function Get-LastActivity {
             return $r
         }
         'NTUSER*'      { return (Pick @(, @($S.NTUSER, 'NTUSER.DAT'))) }
+        'Home folder*' { return (Pick @(, @($S.HomeMod, 'Home folder'))) }
         'LastUseTime*' { return (Pick @(, @($LastUse, 'LastUseTime'))) }
         default {      # newest of everything, including hive timestamps = safest
             return (Pick @(@($LastUse, 'LastUseTime'), @($S.NTUSER, 'NTUSER.DAT'), @($S.Unload, 'Profile unload'),
-                           @($S.UserFiles, 'User files'), @($S.Recent, 'Recent items'), @($S.Apps, 'Browser/Outlook')))
+                           @($S.UserFiles, 'User files'), @($S.Recent, 'Recent items'), @($S.Apps, 'Browser/Outlook'), @($S.HomeMod, 'Home folder')))
         }
     }
 }
@@ -297,9 +298,12 @@ function Start-Scan {
 
             $lastUse = $p.LastUseTime
             $sig = $signals[$p.SID]
-            $s = @{ NTUSER = $null; Unload = $null; UserFiles = $null; Recent = $null; Apps = $null; Created = $null; FolderExists = $true }
+            $s = @{ NTUSER = $null; Unload = $null; UserFiles = $null; Recent = $null; Apps = $null; Created = $null; HomeMod = $null; FolderExists = $true }
             if ($sig) { foreach ($k in @($s.Keys)) { $s[$k] = $sig.$k } }
-            else { try { $s.NTUSER = (Get-Item -LiteralPath (Join-Path $unc 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { } }
+            else {
+                try { $s.NTUSER  = (Get-Item -LiteralPath (Join-Path $unc 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { }
+                try { $s.HomeMod = (Get-Item -LiteralPath $unc -Force -ErrorAction Stop).LastWriteTime } catch { }
+            }
 
             $act  = Get-LastActivity -Basis $basis -S $s -LastUse $lastUse
             $last = $act.Time
@@ -321,7 +325,7 @@ function Start-Scan {
                 (Format-Date $s.NTUSER),
                 $(if ($null -ne $days) { $days } else { '?' }),
                 $status,
-                (Format-Date $s.Unload), (Format-Date $s.UserFiles), (Format-Date $s.Recent), (Format-Date $s.Apps), (Format-Date $s.Created), $act.Source)
+                (Format-Date $s.Unload), (Format-Date $s.HomeMod), (Format-Date $s.UserFiles), (Format-Date $s.Recent), (Format-Date $s.Apps), (Format-Date $s.Created), $act.Source)
 
             $row = $grid.Rows[$grid.Rows.Count - 1]
             if ($status -eq 'STALE') { $row.DefaultCellStyle.BackColor = [Drawing.Color]::MistyRose }
@@ -543,7 +547,7 @@ $btnCancel = New-Object Windows.Forms.Button; $btnCancel.Text = 'Cancel'; $btnCa
 
 [void](New-Label 'Idle time based on:' 385 210 110)
 $cmbBasis = New-Object Windows.Forms.ComboBox; $cmbBasis.Location = '497,209'; $cmbBasis.Size = '270,24'; $cmbBasis.DropDownStyle = 'DropDownList'
-[void]$cmbBasis.Items.AddRange(@('LastUseTime only (Win32_UserProfile)', 'User activity files', 'Newest of all signals (safest)', 'NTUSER.DAT only'))
+[void]$cmbBasis.Items.AddRange(@('LastUseTime only (Win32_UserProfile)', 'User activity files', 'Home folder modified only', 'Newest of all signals (safest)', 'NTUSER.DAT only'))
 $cmbBasis.SelectedIndex = 0
 $form.Controls.Add($cmbBasis)
 $btnExport = New-Object Windows.Forms.Button; $btnExport.Text = 'Export grid to CSV'; $btnExport.Location = '777,206'; $btnExport.Size = '178,30'; $btnExport.Anchor = 'Top,Right'; $form.Controls.Add($btnExport)
@@ -555,12 +559,13 @@ $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false; $grid.R
 $grid.SelectionMode = 'FullRowSelect'; $grid.AutoSizeColumnsMode = 'Fill'; $grid.BackgroundColor = [Drawing.Color]::White
 $colSel = New-Object Windows.Forms.DataGridViewCheckBoxColumn; $colSel.HeaderText = 'Select'; $colSel.FillWeight = 40
 [void]$grid.Columns.Add($colSel)
-foreach ($c in @(@('User', 90), @('SID', 150), @('LastUseTime (WMI)', 90), @('NTUSER.DAT modified', 90), @('Days idle', 50), @('Status', 120), @('Profile unload', 90), @('Newest user file', 90), @('Recent items', 90), @('Browser/Outlook', 90), @('Profile created', 90), @('Basis used', 110))) {
+foreach ($c in @(@('User', 90), @('SID', 150), @('LastUseTime (WMI)', 90), @('NTUSER.DAT modified', 90), @('Days idle', 50), @('Status', 120), @('Profile unload', 90), @('Home folder modified', 90), @('Newest user file', 90), @('Recent items', 90), @('Browser/Outlook', 90), @('Profile created', 90), @('Basis used', 110))) {
     $col = New-Object Windows.Forms.DataGridViewTextBoxColumn; $col.HeaderText = $c[0]; $col.FillWeight = $c[1]; $col.ReadOnly = $true
     [void]$grid.Columns.Add($col)
 }
 $form.Controls.Add($grid)
 $grid.Columns[6].DisplayIndex = $grid.Columns.Count - 1   # keep Status as the last visible column
+$grid.Columns[2].Visible = $false                          # SID is kept internally (row key) but not shown
 
 # Log
 $txtLog = New-Object Windows.Forms.TextBox
@@ -589,7 +594,7 @@ $btnExport.Add_Click({
     if ($d.ShowDialog() -eq 'OK') {
         $out = foreach ($r in $grid.Rows) {
             $o = [ordered]@{}
-            foreach ($c in $grid.Columns) { $o[$c.HeaderText] = $r.Cells[$c.Index].Value }
+            foreach ($c in ($grid.Columns | Where-Object { $_.Visible })) { $o[$c.HeaderText] = $r.Cells[$c.Index].Value }
             [pscustomobject]$o
         }
         $out | Export-Csv -Path $d.FileName -NoTypeInformation -Encoding UTF8
