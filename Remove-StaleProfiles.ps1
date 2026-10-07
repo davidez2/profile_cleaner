@@ -267,7 +267,7 @@ function Start-Scan {
         Write-Log "Scanning $computer for profiles idle more than $threshold days..."
         $session  = Get-CimConn -Computer $computer
         $profiles = Get-CimInstance -CimSession $session -ClassName Win32_UserProfile -ErrorAction Stop |
-                    Where-Object { -not $_.Special -and $_.LocalPath }
+                    Where-Object { -not $_.Special -and $_.LocalPath -like '*\Users\*' }
 
         $profiles | ForEach-Object { $_.LocalPath.Substring(0, 1) } | Select-Object -Unique |
             ForEach-Object { Connect-Share -Computer $computer -DriveLetter $_ }
@@ -543,7 +543,7 @@ $btnCancel = New-Object Windows.Forms.Button; $btnCancel.Text = 'Cancel'; $btnCa
 
 [void](New-Label 'Idle time based on:' 385 210 110)
 $cmbBasis = New-Object Windows.Forms.ComboBox; $cmbBasis.Location = '497,209'; $cmbBasis.Size = '270,24'; $cmbBasis.DropDownStyle = 'DropDownList'
-[void]$cmbBasis.Items.AddRange(@('User activity files (recommended)', 'Newest of all signals (safest)', 'NTUSER.DAT only', 'LastUseTime only (unreliable)'))
+[void]$cmbBasis.Items.AddRange(@('LastUseTime only (Win32_UserProfile)', 'User activity files', 'Newest of all signals (safest)', 'NTUSER.DAT only'))
 $cmbBasis.SelectedIndex = 0
 $form.Controls.Add($cmbBasis)
 $btnExport = New-Object Windows.Forms.Button; $btnExport.Text = 'Export grid to CSV'; $btnExport.Location = '777,206'; $btnExport.Size = '178,30'; $btnExport.Anchor = 'Top,Right'; $form.Controls.Add($btnExport)
