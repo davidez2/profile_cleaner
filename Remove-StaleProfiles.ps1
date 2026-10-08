@@ -10,6 +10,7 @@
       Evidence is collected on the remote PC over WinRM (the C$ share is only a fallback).
     - Backup: 7-Zip runs ON THE REMOTE PC (PowerShell remoting / WinRM) against the local profile folder
       and writes the .7z archive to a folder on the remote PC. No profile data crosses the network.
+      The AppData folder is NOT backed up (it is still removed when the profile is deleted).
     - A profile is deleted only if its archive was created AND passed "7z t".
     - Deletion uses Remove-CimInstance on Win32_UserProfile (removes folder + registry entry).
     - DRY RUN is ON by default: nothing is archived or deleted. It does check remoting, 7-Zip,
@@ -142,21 +143,38 @@ $sbEnsureDir = {
     if (-not (Test-Path -LiteralPath $Dir)) { New-Item -ItemType Directory -Path $Dir -Force | Out-Null }
 }
 $sbSize = {
+    # Size of what the backup will contain: the profile minus its top-level AppData folder.
+    # Skips junctions/symlinks (e.g. "Application Data") so nothing is counted twice.
     param($Path)
-    (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+    function Get-DirBytes([string]$Root, [string[]]$SkipTop = @()) {
+        $total = [int64]0
+        $stack = New-Object 'System.Collections.Generic.Stack[string]'
+        $stack.Push($Root)
+        while ($stack.Count -gt 0) {
+            $d = $stack.Pop()
+            try {
+                foreach ($e in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) {
+                    if ($e -is [IO.DirectoryInfo]) {
+                        if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                        if ($d -eq $Root -and $SkipTop -contains $e.Name) { continue }
+                        $stack.Push($e.FullName)
+                    } else { $total += $e.Length }
+                }
+            } catch { }
+        }
+        $total
+    }
+    Get-DirBytes $Path @('AppData')
 }
 $sbBackup = {
-    param($Exe, $Src, $Archive, $SkipTemp)
+    param($Exe, $Src, $Archive)
     $parent = Split-Path $Src -Parent
     $leaf   = Split-Path $Src -Leaf
     Set-Location -LiteralPath $parent
     $a = @('a', '-t7z', '-mx=3', '-mmt=2', '-snl', '-bso0', '-bsp0', $Archive, $leaf)
-    if ($SkipTemp) {
-        $a += "-xr!$leaf\AppData\Local\Temp"
-        $a += "-xr!$leaf\AppData\Local\Microsoft\Windows\INetCache"
-        $a += "-xr!$leaf\AppData\Local\Google\Chrome\User Data\*\Cache"
-        $a += "-xr!$leaf\AppData\Local\Microsoft\Edge\User Data\*\Cache"
-    }
+    # AppData is never backed up (both switch forms given so the exclusion holds either way)
+    $a += "-x!$leaf\AppData"
+    $a += "-xr!$leaf\AppData"
     $out = & $Exe @a 2>&1
     [pscustomobject]@{ Code = $LASTEXITCODE; Output = (($out | Select-Object -Last 8) -join "`r`n") }
 }
@@ -176,8 +194,27 @@ $sbSignals  = {
     # Collects "last activity" evidence ON the remote PC (no SMB needed).
     # Hive timestamps (NTUSER.DAT, LastUseTime, unload time) can be touched by system services, so we also
     # look for things only a real user session produces: files they saved, Recent items, browser/Outlook activity.
-    param($Items)
+    param($Items, $WithSize)
     $u32 = { param($v) [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$v), 0) }
+    function Get-DirBytes([string]$Root, [string[]]$SkipTop = @()) {
+        # junctions/symlinks are skipped so nothing is counted twice
+        $total = [int64]0
+        $stack = New-Object 'System.Collections.Generic.Stack[string]'
+        $stack.Push($Root)
+        while ($stack.Count -gt 0) {
+            $d = $stack.Pop()
+            try {
+                foreach ($e in ([IO.DirectoryInfo]$d).EnumerateFileSystemInfos()) {
+                    if ($e -is [IO.DirectoryInfo]) {
+                        if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                        if ($d -eq $Root -and $SkipTop -contains $e.Name) { continue }
+                        $stack.Push($e.FullName)
+                    } else { $total += $e.Length }
+                }
+            } catch { }
+        }
+        $total
+    }
     function Get-Newest {
         param([string]$Path, [string]$Filter = '*', [int]$Depth = 0)
         if (-not (Test-Path -LiteralPath $Path)) { return $null }
@@ -210,7 +247,14 @@ $sbSignals  = {
                 if ($ft -gt 0) { $un = [DateTime]::FromFileTime($ft) }
             }
         } catch { }
-        [pscustomobject]@{ SID = $i.SID; FolderExists = $exists; Created = $created; HomeMod = $homeMod; NTUSER = $nt; Unload = $un; UserFiles = $userFiles; Recent = $recent; Apps = $apps }
+        $sizeAll = $null; $sizeBackup = $null
+        if ($exists -and $WithSize) {
+            $sizeBackup = Get-DirBytes $P @('AppData')                  # what the backup will contain
+            $appData = Join-Path $P 'AppData'
+            $sizeApp = if (Test-Path -LiteralPath $appData) { Get-DirBytes $appData } else { [int64]0 }
+            $sizeAll = $sizeBackup + $sizeApp                            # whole home directory
+        }
+        [pscustomobject]@{ SID = $i.SID; FolderExists = $exists; Created = $created; HomeMod = $homeMod; NTUSER = $nt; Unload = $un; UserFiles = $userFiles; Recent = $recent; Apps = $apps; SizeAll = $sizeAll; SizeBackup = $sizeBackup }
     }
 }
 
@@ -222,7 +266,8 @@ function Set-Busy {
     $form.Cursor = if ($Busy) { [System.Windows.Forms.Cursors]::WaitCursor } else { [System.Windows.Forms.Cursors]::Default }
 }
 
-function Format-Size($b) { if ($null -eq $b) { '?' } elseif ($b -ge 1GB) { '{0:N1} GB' -f ($b / 1GB) } else { '{0:N0} MB' -f ($b / 1MB) } }
+function Format-Size($b) { if ($null -eq $b) { '?' } elseif ($b -ge 1GB) { '{0:N1} GB' -f ($b / 1GB) } elseif ($b -ge 1MB) { '{0:N0} MB' -f ($b / 1MB) } else { '{0:N0} KB' -f ($b / 1KB) } }
+function ConvertTo-MB($b) { if ($null -eq $b) { return $null }; return [math]::Round([double]$b / 1MB) }   # numeric so the grid sorts by size
 
 function Format-Date($d) { if ($d) { ([datetime]$d).ToString('yyyy-MM-dd HH:mm') } else { '-' } }
 
@@ -279,9 +324,10 @@ function Start-Scan {
         $signals = @{}
         try {
             Get-PSConn -Computer $computer
-            Write-Log 'Collecting activity evidence from each profile (can take a minute or two on big profiles)...'
+            $withSize = [bool]$chkSize.Checked
+            Write-Log ('Collecting activity evidence{0} from each profile (can take a few minutes on big profiles)...' -f $(if ($withSize) { ' and folder sizes' } else { '' }))
             $items = @($profiles | ForEach-Object { @{ SID = $_.SID; Path = $_.LocalPath } })
-            $res = Invoke-Remote -Script $sbSignals -ArgList @(, $items)
+            $res = Invoke-Remote -Script $sbSignals -ArgList @($items, $withSize)
             foreach ($r in @($res)) { $signals[$r.SID] = $r }
             Write-Log "Collected profile timestamps remotely for $($signals.Count) profile(s)."
         } catch {
@@ -299,7 +345,7 @@ function Start-Scan {
 
             $lastUse = $p.LastUseTime
             $sig = $signals[$p.SID]
-            $s = @{ NTUSER = $null; Unload = $null; UserFiles = $null; Recent = $null; Apps = $null; Created = $null; HomeMod = $null; FolderExists = $true }
+            $s = @{ NTUSER = $null; Unload = $null; UserFiles = $null; Recent = $null; Apps = $null; Created = $null; HomeMod = $null; SizeAll = $null; SizeBackup = $null; FolderExists = $true }
             if ($sig) { foreach ($k in @($s.Keys)) { $s[$k] = $sig.$k } }
             else {
                 try { $s.NTUSER  = (Get-Item -LiteralPath (Join-Path $unc 'NTUSER.DAT') -Force -ErrorAction Stop).LastWriteTime } catch { }
@@ -322,7 +368,7 @@ function Start-Scan {
             elseif ($days -gt $threshold)     { $status = 'STALE'; $select = $true }
             else                              { $status = 'Active' }
 
-            $script:ProfileInfo[$p.SID] = @{ Name = $name; LocalPath = $p.LocalPath; Unc = $unc }
+            $script:ProfileInfo[$p.SID] = @{ Name = $name; LocalPath = $p.LocalPath; Unc = $unc; BackupSize = $s.SizeBackup; HomeSize = $s.SizeAll }
 
             [void]$grid.Rows.Add(
                 $select, $name, $p.SID,
@@ -330,7 +376,8 @@ function Start-Scan {
                 (Format-Date $s.NTUSER),
                 $(if ($null -ne $days) { $days } else { '?' }),
                 $status,
-                (Format-Date $s.Unload), (Format-Date $s.HomeMod), (Format-Date $s.UserFiles), (Format-Date $s.Recent), (Format-Date $s.Apps), (Format-Date $s.Created), $act.Source)
+                (Format-Date $s.Unload), (Format-Date $s.HomeMod), (Format-Date $s.UserFiles), (Format-Date $s.Recent), (Format-Date $s.Apps), (Format-Date $s.Created), $act.Source,
+                (ConvertTo-MB $s.SizeAll), (ConvertTo-MB $s.SizeBackup))
 
             $row = $grid.Rows[$grid.Rows.Count - 1]
             if ($status -eq 'STALE') { $row.DefaultCellStyle.BackColor = [Drawing.Color]::MistyRose }
@@ -364,7 +411,7 @@ function Start-Cleanup {
     }
 
     if (-not $dry) {
-        $msg = "LIVE RUN on $computer`r`n`r`n$($selected.Count) profile(s) will be backed up on that PC to:`r`n$backup`r`n`r`nand then PERMANENTLY DELETED.`r`n`r`nContinue?"
+        $msg = "LIVE RUN on $computer`r`n`r`n$($selected.Count) profile(s) will be backed up on that PC to:`r`n$backup`r`n`r`nand then PERMANENTLY DELETED.`r`n`r`nNOTE: the AppData folder is NOT included in the backup and will be lost.`r`n`r`nContinue?"
         if ([System.Windows.Forms.MessageBox]::Show($msg, 'Confirm deletion', 'YesNo', 'Warning', 'Button2') -ne 'Yes') { return }
     }
 
@@ -406,7 +453,6 @@ function Start-Cleanup {
         }
         if (-not $dry) { Invoke-Remote -Script $sbEnsureDir -ArgList @($backup) | Out-Null }
 
-        $skipTemp = $chkTemp.Checked
         $ok = 0; $failed = 0
         $totalEst = 0
 
@@ -423,11 +469,14 @@ function Start-Cleanup {
             if ($cur.Loaded) { Write-Log "[$name] profile is loaded (user logged on) - skipped." 'WARN'; $row.Cells[6].Value = 'Skipped (loaded)'; continue }
 
             if ($dry) {
-                Write-Log "[DRY RUN] [$name] measuring $($info.LocalPath) on $computer ..."
-                $size = Invoke-Remote -Script $sbSize -ArgList @($info.LocalPath)
-                if ($script:Cancel) { Write-Log 'Cancelled by user.' 'WARN'; break }
+                $size = $info.BackupSize     # measured during the scan (AppData excluded)
+                if ($null -eq $size) {
+                    Write-Log "[DRY RUN] [$name] measuring $($info.LocalPath) on $computer (AppData excluded) ..."
+                    $size = Invoke-Remote -Script $sbSize -ArgList @($info.LocalPath)
+                    if ($script:Cancel) { Write-Log 'Cancelled by user.' 'WARN'; break }
+                }
                 $totalEst += [double]$size
-                Write-Log "[DRY RUN] [$name] size on disk: $(Format-Size $size)"
+                Write-Log "[DRY RUN] [$name] data to back up (AppData excluded): $(Format-Size $size)"
                 Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer : $($info.LocalPath)  ->  $archive"
                 Write-Log "[DRY RUN] [$name] would test the archive, then delete the profile (SID $sid)"
                 $row.Cells[6].Value = 'Dry run OK'
@@ -437,7 +486,7 @@ function Start-Cleanup {
 
             # ---- backup (runs on the remote PC)
             Write-Log "[$name] backing up on $computer -> $archive ..."
-            $r = Invoke-Remote -Script $sbBackup -ArgList @($exe, $info.LocalPath, $archive, $skipTemp) -KillMatch $archive
+            $r = Invoke-Remote -Script $sbBackup -ArgList @($exe, $info.LocalPath, $archive) -KillMatch $archive
             if ($null -eq $r) {
                 Write-Log "[$name] cancelled during backup; removing partial archive." 'WARN'
                 Invoke-Command -Session $script:PSSess -ScriptBlock $sbRmFile -ArgumentList $archive -ErrorAction SilentlyContinue
@@ -480,7 +529,7 @@ function Start-Cleanup {
         }
 
         if ($dry -and $totalEst -gt 0) {
-            $msg = "Dry run: total uncompressed size of selected profiles = $(Format-Size $totalEst); free space on target drive = $(Format-Size $prep.FreeBytes)."
+            $msg = "Dry run: total uncompressed size to back up (AppData excluded) =$(Format-Size $totalEst); free space on target drive = $(Format-Size $prep.FreeBytes)."
             if ($prep.FreeBytes -and $totalEst -gt $prep.FreeBytes) { Write-Log "$msg Archives are compressed, but this may NOT fit." 'WARN' } else { Write-Log $msg }
         }
         Write-Log "=== Finished ($mode): $ok succeeded, $failed failed ==="
@@ -544,7 +593,7 @@ $txtExclude.Text = 'Administrator,Public,Default,Default User,All Users,defaultu
 
 # Row 6: options
 $chkDry = New-Object Windows.Forms.CheckBox; $chkDry.Text = 'DRY RUN (no backup, no delete)'; $chkDry.Location = '190,174'; $chkDry.Size = '260,24'; $chkDry.Checked = $true; $chkDry.Font = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold); $form.Controls.Add($chkDry)
-$chkTemp = New-Object Windows.Forms.CheckBox; $chkTemp.Text = 'Skip temp / browser cache folders in backup'; $chkTemp.Location = '460,174'; $chkTemp.Size = '320,24'; $chkTemp.Checked = $true; $form.Controls.Add($chkTemp)
+$chkSize = New-Object Windows.Forms.CheckBox; $chkSize.Text = 'Calculate home folder sizes (slower scan)'; $chkSize.Location = '460,174'; $chkSize.Size = '320,24'; $chkSize.Checked = $true; $form.Controls.Add($chkSize)
 
 # Row 7: buttons
 $btnScan = New-Object Windows.Forms.Button; $btnScan.Text = '1. Scan'; $btnScan.Location = '12,206'; $btnScan.Size = '110,30'; $form.Controls.Add($btnScan)
@@ -565,11 +614,14 @@ $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false; $grid.R
 $grid.SelectionMode = 'FullRowSelect'; $grid.AutoSizeColumnsMode = 'Fill'; $grid.BackgroundColor = [Drawing.Color]::White
 $colSel = New-Object Windows.Forms.DataGridViewCheckBoxColumn; $colSel.HeaderText = 'Select'; $colSel.FillWeight = 40
 [void]$grid.Columns.Add($colSel)
-foreach ($c in @(@('User', 90), @('SID', 150), @('LastUseTime (WMI)', 90), @('NTUSER.DAT modified', 90), @('Days idle', 50), @('Status', 120), @('Profile unload', 90), @('Home folder modified', 90), @('Newest user file', 90), @('Recent items', 90), @('Browser/Outlook', 90), @('Profile created', 90), @('Basis used', 110))) {
+foreach ($c in @(@('User', 90), @('SID', 150), @('LastUseTime (WMI)', 90), @('NTUSER.DAT modified', 90), @('Days idle', 50), @('Status', 120), @('Profile unload', 90), @('Home folder modified', 90), @('Newest user file', 90), @('Recent items', 90), @('Browser/Outlook', 90), @('Profile created', 90), @('Basis used', 110), @('Home size (MB)', 70), @('Backup size (MB, no AppData)', 90))) {
     $col = New-Object Windows.Forms.DataGridViewTextBoxColumn; $col.HeaderText = $c[0]; $col.FillWeight = $c[1]; $col.ReadOnly = $true
     [void]$grid.Columns.Add($col)
 }
 $form.Controls.Add($grid)
+foreach ($ci in 14, 15) { $grid.Columns[$ci].DefaultCellStyle.Format = 'N0'; $grid.Columns[$ci].DefaultCellStyle.Alignment = 'MiddleRight' }
+$grid.Columns[14].DisplayIndex = 2                         # sizes right after the user name
+$grid.Columns[15].DisplayIndex = 3
 $grid.Columns[6].DisplayIndex = $grid.Columns.Count - 1   # keep Status as the last visible column
 $grid.Columns[2].Visible = $false                          # SID is kept internally (row key) but not shown
 
