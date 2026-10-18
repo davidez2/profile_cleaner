@@ -22,6 +22,7 @@
     7-Zip must be installed on the remote PC, OR give a local 7za.exe (standalone "7-Zip Extra")
     / 7z.exe and the script copies it to the remote temp folder for the run and removes it afterwards.
     
+    
 #>
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
