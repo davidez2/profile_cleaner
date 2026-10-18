@@ -2,6 +2,7 @@
 <#
 .SYNOPSIS
     GUI tool: find stale user profiles on a remote PC, back them up with 7-Zip ON THAT PC, then delete them.
+    
 
 .DESCRIPTION
     - Scan: lists profiles via CIM (WinRM with DCOM fallback). Last activity is judged by a selectable basis;
