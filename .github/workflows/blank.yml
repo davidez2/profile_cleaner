@@ -1,36 +1,95 @@
-# This is a basic workflow to help you get started with Actions
+name: Release
 
-name: CI
-
-# Controls when the workflow will run
+# Pushing a tag such as v1.2.0 builds the zip and publishes a GitHub release.
+# Running it manually (Actions tab > Release > Run workflow) only builds the zip
+# and attaches it to the run as a downloadable artifact; no release is created.
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for the manual build (e.g. 1.2.0)'
+        required: false
+        default: 'dev'
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: write   # needed to create the release
+
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Check out the repository
+        uses: actions/checkout@v4
 
-      - name: Zip Deploy
-        # You may pin to the exact commit or the version.
-        # uses: mkyai/zip-deploy@db8f801175f9ddefbc440f36c7b05654560b8088
-        uses: mkyai/zip-deploy@v1.0.8
+      - name: Work out the version
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${INPUT_VERSION:-dev}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VERSION"
+
+      - name: Check the PowerShell script for syntax errors
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:GITHUB_WORKSPACE 'Remove-StaleProfiles.ps1'
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            foreach ($e in $errors) {
+              Write-Host "::error file=Remove-StaleProfiles.ps1,line=$($e.Extent.StartLineNumber)::$($e.Message)"
+            }
+            exit 1
+          }
+          Write-Host 'No syntax errors found.'
+
+      - name: Build the zip and checksum
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          NAME="Remove-StaleProfiles-${VERSION}"
+          mkdir -p "dist/${NAME}"
+
+          cp Remove-StaleProfiles.ps1 README.md "dist/${NAME}/"
+          if [ -f LICENSE ]; then cp LICENSE "dist/${NAME}/"; fi
+
+          cd dist
+          zip -r "${NAME}.zip" "${NAME}"
+          sha256sum "${NAME}.zip" > "${NAME}.zip.sha256"
+
+          echo "Contents of ${NAME}.zip:"
+          unzip -l "${NAME}.zip"
+
+      - name: Upload the zip as a workflow artifact
+        uses: actions/upload-artifact@v4
         with:
-          # Deployment webhook to handle @code.zip file
-          webhook: # optional
-          # Webhook secret for request verification
-          secret: # optional
+          name: Remove-StaleProfiles-${{ steps.ver.outputs.version }}
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+      - name: Create the GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Tags with a hyphen (v1.2.0-beta1) are published as pre-releases
+          FLAGS=""
+          case "$TAG" in *-*) FLAGS="--prerelease" ;; esac
+
+          gh release create "$TAG" dist/*.zip dist/*.zip.sha256 \
+            --title "$TAG" \
+            --generate-notes \
+            $FLAGS
