@@ -1,10 +1,13 @@
 name: Release
 
 # Pushing a tag such as v1.2.0 builds the zip and publishes a GitHub release.
-# Running it manually (Actions tab > Release > Run workflow) only builds the zip
-# and attaches it to the run as a downloadable artifact; no release is created.
+# Pushing to any branch, or running it manually (Actions tab > Release > Run workflow),
+# only builds the zip and attaches it to the run as a downloadable artifact;
+# no release is created.
 on:
   push:
+    branches:
+      - '**'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -32,8 +35,10 @@ jobs:
         run: |
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
-          else
+          elif [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             VERSION="${INPUT_VERSION:-dev}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"   # branch push: label the build with the commit
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building version: $VERSION"
