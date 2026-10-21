@@ -2,7 +2,6 @@
 <#
 .SYNOPSIS
     GUI tool: find stale user profiles on a remote PC, back them up with 7-Zip ON THAT PC, then delete them.
-    
 
 .DESCRIPTION
     - Scan: lists profiles via CIM (WinRM with DCOM fallback). Last activity is judged by a selectable basis;
@@ -12,6 +11,8 @@
     - Backup: 7-Zip runs ON THE REMOTE PC (PowerShell remoting / WinRM) against the local profile folder
       and writes the .7z archive to a folder on the remote PC. No profile data crosses the network.
       The AppData folder is NOT backed up (it is still removed when the profile is deleted).
+    - Optional: "Also clean temp files in active profiles" deletes old files (default: older than 7 days)
+      from the temp/cache folders of NON-stale profiles whose users are not logged on. Dry run only counts them.
     - A profile is deleted only if its archive was created AND passed "7z t".
     - Deletion uses Remove-CimInstance on Win32_UserProfile (removes folder + registry entry).
     - DRY RUN is ON by default: nothing is archived or deleted. It does check remoting, 7-Zip,
@@ -21,8 +22,6 @@
     WinRM (Enable-PSRemoting) must be enabled on the remote PC for the backup step.
     7-Zip must be installed on the remote PC, OR give a local 7za.exe (standalone "7-Zip Extra")
     / 7z.exe and the script copies it to the remote temp folder for the run and removes it afterwards.
-    
-    
 #>
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -193,6 +192,63 @@ $sbExists   = { param($Path) Test-Path -LiteralPath $Path }
 $sbMkTemp   = { $d = Join-Path $env:TEMP ('7z_' + [guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $d | Out-Null; $d }
 $sbRmTemp   = { param($Path) Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue }
 $sbRmFile   = { param($Path) Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+$sbCleanTemp = {
+    # Deletes OLD files from a user's temp/cache folders (the profile itself is kept).
+    # Files newer than $OlderThanDays days are left alone (age = newer of last-write and creation time),
+    # junctions/symlinks are never followed, and files that are in use or denied are skipped.
+    # With $CountOnly nothing is deleted; the files that would be removed are only counted.
+    param($ProfilePath, $OlderThanDays, $CountOnly)
+    $cutoff  = (Get-Date).AddDays(-[double]$OlderThanDays)
+    $targets = @('AppData\Local\Temp',
+                 'AppData\Local\Microsoft\Windows\INetCache',
+                 'AppData\Local\CrashDumps',
+                 'AppData\Local\Microsoft\Windows\WER')
+    $files = 0; $bytes = [int64]0; $failed = 0; $dirs = 0
+
+    foreach ($t in $targets) {
+        $root = Join-Path $ProfilePath $t
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+
+        $dirOrder = New-Object System.Collections.Generic.List[string]
+        $dirTicks = @{}
+        $stack = New-Object 'System.Collections.Generic.Stack[string]'
+        $stack.Push($root)
+        while ($stack.Count -gt 0) {
+            $d = $stack.Pop()
+            if ($d -ne $root) { $dirOrder.Add($d) }
+            try { $entries = @(([IO.DirectoryInfo]$d).GetFileSystemInfos()) } catch { $failed++; continue }
+            foreach ($e in $entries) {
+                if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                if ($e -is [IO.DirectoryInfo]) {
+                    $dirTicks[$e.FullName] = [Math]::Max($e.LastWriteTime.Ticks, $e.CreationTime.Ticks)
+                    $stack.Push($e.FullName)
+                } elseif ([Math]::Max($e.LastWriteTime.Ticks, $e.CreationTime.Ticks) -lt $cutoff.Ticks) {
+                    if ($CountOnly) {
+                        $files++; $bytes += $e.Length
+                    } else {
+                        try {
+                            $len = $e.Length
+                            Remove-Item -LiteralPath $e.FullName -Force -ErrorAction Stop
+                            $files++; $bytes += $len
+                        } catch { $failed++ }
+                    }
+                }
+            }
+        }
+
+        if (-not $CountOnly) {
+            # remove folders that are now empty and old, deepest first (the target folder itself is kept)
+            for ($i = $dirOrder.Count - 1; $i -ge 0; $i--) {
+                $p = $dirOrder[$i]
+                try {
+                    $di = [IO.DirectoryInfo]$p
+                    if ($dirTicks[$p] -lt $cutoff.Ticks -and $di.GetFileSystemInfos().Count -eq 0) { $di.Delete(); $dirs++ }
+                } catch { }
+            }
+        }
+    }
+    @{ Files = $files; Bytes = $bytes; Failed = $failed; Dirs = $dirs }
+}
 $sbSignals  = {
     # Collects "last activity" evidence ON the remote PC (no SMB needed).
     # Hive timestamps (NTUSER.DAT, LastUseTime, unload time) can be touched by system services, so we also
@@ -405,16 +461,36 @@ function Start-Cleanup {
     $local7z   = $txtLocal7z.Text.Trim()
     $backup    = $txtBackup.Text.Trim().TrimEnd('\')
 
-    $selected = @($grid.Rows | Where-Object { $_.Cells[0].Value -eq $true })
-    if ($selected.Count -eq 0) { [void][System.Windows.Forms.MessageBox]::Show('No profiles selected. Run a scan and tick the profiles to process.'); return }
-    if ($backup -notmatch '^[A-Za-z]:\\.+') { [void][System.Windows.Forms.MessageBox]::Show('Backup folder must be a local path on the remote PC, e.g. D:\ProfileBackups'); return }
-    foreach ($row in $selected) {
-        $lp = $script:ProfileInfo[$row.Cells[2].Value].LocalPath
-        if ($backup -like "$lp*") { [void][System.Windows.Forms.MessageBox]::Show("The backup folder cannot be inside a profile that will be deleted ($lp)."); return }
+    $selected  = @($grid.Rows | Where-Object { $_.Cells[0].Value -eq $true })
+    $cleanTemp = [bool]$chkTempClean.Checked
+    $tempDays  = [int]$numTempDays.Value
+    # active (non-stale) profiles for the optional temp cleanup; anything ticked for deletion is excluded
+    $activeRows = @()
+    if ($cleanTemp) {
+        $activeRows = @($grid.Rows | Where-Object { ([string]$_.Cells[6].Value) -like 'Active*' -and $_.Cells[0].Value -ne $true })
+    }
+
+    if ($selected.Count -eq 0 -and $activeRows.Count -eq 0) {
+        [void][System.Windows.Forms.MessageBox]::Show('Nothing to do. Tick the stale profiles to remove, and/or tick "Also clean temp files in active profiles" (after a scan that found active profiles).')
+        return
+    }
+    if ($selected.Count -gt 0) {
+        if ($backup -notmatch '^[A-Za-z]:\\.+') { [void][System.Windows.Forms.MessageBox]::Show('Backup folder must be a local path on the remote PC, e.g. D:\ProfileBackups'); return }
+        foreach ($row in $selected) {
+            $lp = $script:ProfileInfo[$row.Cells[2].Value].LocalPath
+            if ($backup -like "$lp*") { [void][System.Windows.Forms.MessageBox]::Show("The backup folder cannot be inside a profile that will be deleted ($lp)."); return }
+        }
     }
 
     if (-not $dry) {
-        $msg = "LIVE RUN on $computer`r`n`r`n$($selected.Count) profile(s) will be backed up on that PC to:`r`n$backup`r`n`r`nand then PERMANENTLY DELETED.`r`n`r`nNOTE: the AppData folder is NOT included in the backup and will be lost.`r`n`r`nContinue?"
+        $parts = @()
+        if ($selected.Count -gt 0) {
+            $parts += "$($selected.Count) stale profile(s) will be backed up on that PC to:`r`n$backup`r`nand then PERMANENTLY DELETED.`r`n`r`nNOTE: the AppData folder is NOT included in the backup and will be lost."
+        }
+        if ($activeRows.Count -gt 0) {
+            $parts += "Temp files older than $tempDays day(s) will be PERMANENTLY DELETED from $($activeRows.Count) active profile(s) (only users who are not logged on; the profiles themselves are kept)."
+        }
+        $msg = "LIVE RUN on $computer`r`n`r`n" + ($parts -join "`r`n`r`n") + "`r`n`r`nContinue?"
         if ([System.Windows.Forms.MessageBox]::Show($msg, 'Confirm deletion', 'YesNo', 'Warning', 'Button2') -ne 'Yes') { return }
     }
 
@@ -426,35 +502,38 @@ function Start-Cleanup {
     if (-not $dry) { $script:LogFile = $localLog }
     try {
         $mode = if ($dry) { 'DRY RUN (no changes will be made)' } else { 'LIVE' }
-        Write-Log "=== Starting $mode on $computer - $($selected.Count) profile(s) ==="
+        Write-Log "=== Starting $mode on $computer - $($selected.Count) profile(s) to remove, $($activeRows.Count) active profile(s) for temp cleanup ==="
 
         $cim = Get-CimConn -Computer $computer
         Get-PSConn -Computer $computer
 
-        # ---- prepare: check 7-Zip + backup drive on the remote PC
-        $prep = Invoke-Remote -Script $sbPrepare -ArgList @($remote7z, $backup)
-        if ($null -eq $prep) { return }
-        if (-not $prep.DriveOk) { throw "Drive for '$backup' does not exist on $computer." }
-        Write-Log ("Backup target on {0}: {1}  (free space: {2}){3}" -f $computer, $backup, (Format-Size $prep.FreeBytes), $(if ($prep.DirExists) { '' } else { '  [folder will be created]' }))
+        $prep = $null
+        $exe  = $remote7z
+        if ($selected.Count -gt 0) {
+            # ---- prepare: check 7-Zip + backup drive on the remote PC
+            $prep = Invoke-Remote -Script $sbPrepare -ArgList @($remote7z, $backup)
+            if ($null -eq $prep) { return }
+            if (-not $prep.DriveOk) { throw "Drive for '$backup' does not exist on $computer." }
+            Write-Log ("Backup target on {0}: {1}  (free space: {2}){3}" -f $computer, $backup, (Format-Size $prep.FreeBytes), $(if ($prep.DirExists) { '' } else { '  [folder will be created]' }))
 
-        $exe = $remote7z
-        if (-not $prep.ExeFound) {
-            if ($local7z -and (Test-Path -LiteralPath $local7z)) {
-                if ($dry) {
-                    Write-Log "7-Zip not found at '$remote7z' on $computer. A live run would copy '$local7z' to its temp folder." 'WARN'
+            if (-not $prep.ExeFound) {
+                if ($local7z -and (Test-Path -LiteralPath $local7z)) {
+                    if ($dry) {
+                        Write-Log "7-Zip not found at '$remote7z' on $computer. A live run would copy '$local7z' to its temp folder." 'WARN'
+                    } else {
+                        $script:RemoteTemp = Invoke-Remote -Script $sbMkTemp -ArgList @()
+                        Write-Log "7-Zip not found on $computer; copying '$local7z' to $($script:RemoteTemp)..."
+                        Copy-Item -LiteralPath $local7z -Destination $script:RemoteTemp -ToSession $script:PSSess -ErrorAction Stop
+                        $dll = Join-Path (Split-Path $local7z -Parent) '7z.dll'
+                        if (Test-Path -LiteralPath $dll) { Copy-Item -LiteralPath $dll -Destination $script:RemoteTemp -ToSession $script:PSSess -ErrorAction Stop }
+                        $exe = Join-Path $script:RemoteTemp (Split-Path $local7z -Leaf)
+                    }
                 } else {
-                    $script:RemoteTemp = Invoke-Remote -Script $sbMkTemp -ArgList @()
-                    Write-Log "7-Zip not found on $computer; copying '$local7z' to $($script:RemoteTemp)..."
-                    Copy-Item -LiteralPath $local7z -Destination $script:RemoteTemp -ToSession $script:PSSess -ErrorAction Stop
-                    $dll = Join-Path (Split-Path $local7z -Parent) '7z.dll'
-                    if (Test-Path -LiteralPath $dll) { Copy-Item -LiteralPath $dll -Destination $script:RemoteTemp -ToSession $script:PSSess -ErrorAction Stop }
-                    $exe = Join-Path $script:RemoteTemp (Split-Path $local7z -Leaf)
+                    throw "7-Zip not found at '$remote7z' on $computer, and no valid local 7z/7za.exe was given to copy over."
                 }
-            } else {
-                throw "7-Zip not found at '$remote7z' on $computer, and no valid local 7z/7za.exe was given to copy over."
             }
+            if (-not $dry) { Invoke-Remote -Script $sbEnsureDir -ArgList @($backup) | Out-Null }
         }
-        if (-not $dry) { Invoke-Remote -Script $sbEnsureDir -ArgList @($backup) | Out-Null }
 
         $ok = 0; $failed = 0
         $totalEst = 0
@@ -480,7 +559,7 @@ function Start-Cleanup {
                 }
                 $totalEst += [double]$size
                 Write-Log "[DRY RUN] [$name] data to back up (AppData excluded): $(Format-Size $size)"
-                Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer : $($info.LocalPath)  ->  $archive"
+                Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer: $($info.LocalPath)  ->  $archive"
                 Write-Log "[DRY RUN] [$name] would test the archive, then delete the profile (SID $sid)"
                 $row.Cells[6].Value = 'Dry run OK'
                 $ok++
@@ -531,8 +610,34 @@ function Start-Cleanup {
             }
         }
 
+        # ---- optional: clean old temp files in active (non-stale) profiles
+        if ($activeRows.Count -gt 0 -and -not $script:Cancel) {
+            Write-Log ("=== Temp cleanup: {0} active profile(s), files older than {1} day(s){2} ===" -f $activeRows.Count, $tempDays, $(if ($dry) { ' [DRY RUN: counting only]' } else { '' }))
+            $tFiles = 0; $tBytes = [int64]0
+            foreach ($row in $activeRows) {
+                if ($script:Cancel) { Write-Log 'Cancelled by user.' 'WARN'; break }
+                $sid  = $row.Cells[2].Value
+                $info = $script:ProfileInfo[$sid]
+                $name = $info.Name
+
+                # Safety re-check: only touch profiles of users who are NOT logged on
+                $cur = Get-CimInstance -CimSession $cim -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue
+                if (-not $cur)   { Write-Log "[$name] profile no longer exists - temp cleanup skipped." 'WARN'; continue }
+                if ($cur.Loaded) { Write-Log "[$name] user is logged on - temp cleanup skipped." 'WARN'; continue }
+
+                $r = Invoke-Remote -Script $sbCleanTemp -ArgList @($info.LocalPath, $tempDays, [bool]$dry)
+                if ($null -eq $r) { Write-Log "[$name] cancelled during temp cleanup." 'WARN'; break }
+                $tFiles += $r.Files; $tBytes += $r.Bytes
+                $verb    = if ($dry) { 'would delete' } else { 'deleted' }
+                $skipTxt = if ($r.Failed -gt 0) { ", $($r.Failed) in use or access denied (left alone)" } else { '' }
+                Write-Log ('[{0}] {1} {2} file(s), {3}{4}' -f $name, $verb, $r.Files, (Format-Size $r.Bytes), $skipTxt)
+                $row.Cells[6].Value = if ($dry) { 'Active - dry run: {0} of temp' -f (Format-Size $r.Bytes) } else { 'Active - temp cleaned ({0})' -f (Format-Size $r.Bytes) }
+            }
+            Write-Log ('=== Temp cleanup {0}: {1} file(s), {2} ===' -f $(if ($dry) { 'would free' } else { 'freed' }), $tFiles, (Format-Size $tBytes))
+        }
+
         if ($dry -and $totalEst -gt 0) {
-            $msg = "Dry run: total uncompressed size to back up (AppData excluded) =$(Format-Size $totalEst); free space on target drive = $(Format-Size $prep.FreeBytes)."
+            $msg = "Dry run: total uncompressed size to back up (AppData excluded) = $(Format-Size $totalEst); free space on target drive = $(Format-Size $prep.FreeBytes)."
             if ($prep.FreeBytes -and $totalEst -gt $prep.FreeBytes) { Write-Log "$msg Archives are compressed, but this may NOT fit." 'WARN' } else { Write-Log $msg }
         }
         Write-Log "=== Finished ($mode): $ok succeeded, $failed failed ==="
@@ -544,7 +649,7 @@ function Start-Cleanup {
             $script:RemoteTemp = $null
         }
         # keep a copy of the log next to the archives on the remote PC
-        if (-not $dry -and $script:PSSess -and (Test-Path -LiteralPath $localLog)) {
+        if (-not $dry -and $selected.Count -gt 0 -and $script:PSSess -and (Test-Path -LiteralPath $localLog)) {
             try { Copy-Item -LiteralPath $localLog -Destination $backup -ToSession $script:PSSess -ErrorAction Stop } catch { }
         }
         if (-not $dry) { Write-Log "Local log: $localLog" }
@@ -598,21 +703,26 @@ $txtExclude.Text = 'Administrator,Public,Default,Default User,All Users,defaultu
 $chkDry = New-Object Windows.Forms.CheckBox; $chkDry.Text = 'DRY RUN (no backup, no delete)'; $chkDry.Location = '190,174'; $chkDry.Size = '260,24'; $chkDry.Checked = $true; $chkDry.Font = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold); $form.Controls.Add($chkDry)
 $chkSize = New-Object Windows.Forms.CheckBox; $chkSize.Text = 'Calculate home folder sizes (slower scan)'; $chkSize.Location = '460,174'; $chkSize.Size = '320,24'; $chkSize.Checked = $true; $form.Controls.Add($chkSize)
 
-# Row 7: buttons
-$btnScan = New-Object Windows.Forms.Button; $btnScan.Text = '1. Scan'; $btnScan.Location = '12,206'; $btnScan.Size = '110,30'; $form.Controls.Add($btnScan)
-$btnRun  = New-Object Windows.Forms.Button; $btnRun.Text = '2. Run selected'; $btnRun.Location = '130,206'; $btnRun.Size = '140,30'; $form.Controls.Add($btnRun)
-$btnCancel = New-Object Windows.Forms.Button; $btnCancel.Text = 'Cancel'; $btnCancel.Location = '278,206'; $btnCancel.Size = '90,30'; $btnCancel.Enabled = $false; $form.Controls.Add($btnCancel)
+# Row 6b: temp cleanup of active (non-stale) profiles
+$chkTempClean = New-Object Windows.Forms.CheckBox; $chkTempClean.Text = 'Also clean temp files in active (non-stale) profiles'; $chkTempClean.Location = '190,204'; $chkTempClean.Size = '330,24'; $chkTempClean.Checked = $false; $form.Controls.Add($chkTempClean)
+[void](New-Label 'Only files older than (days):' 530 204 160)
+$numTempDays = New-Object Windows.Forms.NumericUpDown; $numTempDays.Location = '695,205'; $numTempDays.Size = '60,22'; $numTempDays.Minimum = 0; $numTempDays.Maximum = 365; $numTempDays.Value = 7; $form.Controls.Add($numTempDays)
 
-[void](New-Label 'Idle time based on:' 385 210 110)
-$cmbBasis = New-Object Windows.Forms.ComboBox; $cmbBasis.Location = '497,209'; $cmbBasis.Size = '270,24'; $cmbBasis.DropDownStyle = 'DropDownList'
+# Row 7: buttons
+$btnScan = New-Object Windows.Forms.Button; $btnScan.Text = '1. Scan'; $btnScan.Location = '12,236'; $btnScan.Size = '110,30'; $form.Controls.Add($btnScan)
+$btnRun  = New-Object Windows.Forms.Button; $btnRun.Text = '2. Run selected'; $btnRun.Location = '130,236'; $btnRun.Size = '140,30'; $form.Controls.Add($btnRun)
+$btnCancel = New-Object Windows.Forms.Button; $btnCancel.Text = 'Cancel'; $btnCancel.Location = '278,236'; $btnCancel.Size = '90,30'; $btnCancel.Enabled = $false; $form.Controls.Add($btnCancel)
+
+[void](New-Label 'Idle time based on:' 385 240 110)
+$cmbBasis = New-Object Windows.Forms.ComboBox; $cmbBasis.Location = '497,239'; $cmbBasis.Size = '270,24'; $cmbBasis.DropDownStyle = 'DropDownList'
 [void]$cmbBasis.Items.AddRange(@('LastUseTime only (Win32_UserProfile)', 'User activity files', 'Home folder modified only', 'Newest of all signals (safest)', 'NTUSER.DAT only'))
 $cmbBasis.SelectedIndex = 0
 $form.Controls.Add($cmbBasis)
-$btnExport = New-Object Windows.Forms.Button; $btnExport.Text = 'Export grid to CSV'; $btnExport.Location = '777,206'; $btnExport.Size = '178,30'; $btnExport.Anchor = 'Top,Right'; $form.Controls.Add($btnExport)
+$btnExport = New-Object Windows.Forms.Button; $btnExport.Text = 'Export grid to CSV'; $btnExport.Location = '777,236'; $btnExport.Size = '178,30'; $btnExport.Anchor = 'Top,Right'; $form.Controls.Add($btnExport)
 
 # Grid
 $grid = New-Object Windows.Forms.DataGridView
-$grid.Location = '12,244'; $grid.Size = '943,240'; $grid.Anchor = 'Top,Left,Right'
+$grid.Location = '12,274'; $grid.Size = '943,240'; $grid.Anchor = 'Top,Left,Right'
 $grid.AllowUserToAddRows = $false; $grid.AllowUserToDeleteRows = $false; $grid.RowHeadersVisible = $false
 $grid.SelectionMode = 'FullRowSelect'; $grid.AutoSizeColumnsMode = 'Fill'; $grid.BackgroundColor = [Drawing.Color]::White
 $colSel = New-Object Windows.Forms.DataGridViewCheckBoxColumn; $colSel.HeaderText = 'Select'; $colSel.FillWeight = 40
@@ -630,7 +740,7 @@ $grid.Columns[2].Visible = $false                          # SID is kept interna
 
 # Log
 $txtLog = New-Object Windows.Forms.TextBox
-$txtLog.Location = '12,492'; $txtLog.Size = '943,240'; $txtLog.Anchor = 'Top,Bottom,Left,Right'
+$txtLog.Location = '12,522'; $txtLog.Size = '943,210'; $txtLog.Anchor = 'Top,Bottom,Left,Right'
 $txtLog.Multiline = $true; $txtLog.ScrollBars = 'Vertical'; $txtLog.ReadOnly = $true
 $txtLog.Font = New-Object Drawing.Font('Consolas', 9); $txtLog.BackColor = [Drawing.Color]::White
 $form.Controls.Add($txtLog)
