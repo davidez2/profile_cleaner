@@ -559,7 +559,7 @@ function Start-Cleanup {
                 }
                 $totalEst += [double]$size
                 Write-Log "[DRY RUN] [$name] data to back up (AppData excluded): $(Format-Size $size)"
-                Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer: $($info.LocalPath)  ->  $archive"
+                Write-Log "[DRY RUN] [$name] would run 7-Zip on $computer : $($info.LocalPath)  ->  $archive"
                 Write-Log "[DRY RUN] [$name] would test the archive, then delete the profile (SID $sid)"
                 $row.Cells[6].Value = 'Dry run OK'
                 $ok++
